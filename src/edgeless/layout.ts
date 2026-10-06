@@ -265,3 +265,85 @@ export function sortByFractionalIndex<T extends { index?: unknown }>(
     return 0;
   });
 }
+
+export type LayoutMode = "flow" | "grid" | "row" | "column";
+
+export interface LayoutNode {
+  key: string;
+  width: number;
+  height: number;
+}
+
+/**
+ * Auto-place nodes (top-left coordinates). "flow" ranks nodes by longest path
+ * along edges (a flowchart: one column per step when direction is "right");
+ * "grid"/"row"/"column" place nodes in reading order on a uniform grid.
+ * ponytail: no crossing minimisation inside a rank; add barycenter ordering if diagrams get tangled.
+ */
+export function layoutNodes(
+  nodes: LayoutNode[],
+  edges: Array<{ from: string; to: string }>,
+  opts: { mode: LayoutMode; direction?: "right" | "down"; columns?: number; gapX?: number; gapY?: number; originX?: number; originY?: number },
+): Map<string, { x: number; y: number }> {
+  const out = new Map<string, { x: number; y: number }>();
+  if (nodes.length === 0) return out;
+  const gapX = opts.gapX ?? 80;
+  const gapY = opts.gapY ?? 60;
+  const ox = opts.originX ?? 0;
+  const oy = opts.originY ?? 0;
+
+  if (opts.mode !== "flow") {
+    const columns = opts.mode === "row" ? nodes.length
+      : opts.mode === "column" ? 1
+      : Math.max(1, opts.columns ?? Math.ceil(Math.sqrt(nodes.length)));
+    const cellW = Math.max(...nodes.map(n => n.width));
+    const cellH = Math.max(...nodes.map(n => n.height));
+    nodes.forEach((n, i) => {
+      const col = i % columns;
+      const row = Math.floor(i / columns);
+      out.set(n.key, {
+        x: Math.round(ox + col * (cellW + gapX) + (cellW - n.width) / 2),
+        y: Math.round(oy + row * (cellH + gapY) + (cellH - n.height) / 2),
+      });
+    });
+    return out;
+  }
+
+  // Longest-path ranks; capped relaxation so cycles terminate.
+  const keys = new Set(nodes.map(n => n.key));
+  const rank = new Map(nodes.map(n => [n.key, 0]));
+  const inner = edges.filter(e => keys.has(e.from) && keys.has(e.to) && e.from !== e.to);
+  for (let pass = 0; pass < nodes.length; pass++) {
+    let changed = false;
+    for (const e of inner) {
+      const next = rank.get(e.from)! + 1;
+      if (next > rank.get(e.to)! && next < nodes.length) { rank.set(e.to, next); changed = true; }
+    }
+    if (!changed) break;
+  }
+  const ranks: LayoutNode[][] = [];
+  for (const n of nodes) (ranks[rank.get(n.key)!] ??= []).push(n);
+
+  const horizontal = (opts.direction ?? "right") === "right";
+  // Along the flow axis each rank takes its widest (or tallest) member; across it, ranks are centered.
+  const along = (n: LayoutNode) => (horizontal ? n.width : n.height);
+  const across = (n: LayoutNode) => (horizontal ? n.height : n.width);
+  const gapAlong = horizontal ? gapX : gapY;
+  const gapAcross = horizontal ? gapY : gapX;
+  const extent = (r: LayoutNode[]) => r.reduce((s, n) => s + across(n), 0) + gapAcross * (r.length - 1);
+  const maxExtent = Math.max(...ranks.filter(Boolean).map(extent));
+  let cursorAlong = 0;
+  for (const r of ranks) {
+    if (!r) continue;
+    const size = Math.max(...r.map(along));
+    let cursorAcross = (maxExtent - extent(r)) / 2;
+    for (const n of r) {
+      const a = cursorAlong + (size - along(n)) / 2;
+      const b = cursorAcross;
+      out.set(n.key, horizontal ? { x: Math.round(ox + a), y: Math.round(oy + b) } : { x: Math.round(ox + b), y: Math.round(oy + a) });
+      cursorAcross += across(n) + gapAcross;
+    }
+    cursorAlong += size + gapAlong;
+  }
+  return out;
+}

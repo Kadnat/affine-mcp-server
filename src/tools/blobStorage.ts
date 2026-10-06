@@ -131,7 +131,7 @@ function guessMime(name: string): string | undefined {
 
 // filePath/url read from the machine running the server, so they are only
 // allowed for a local stdio server (in HTTP mode they would be file read / SSRF).
-async function loadBlobSource(
+export async function loadBlobSource(
   src: { content?: string; encoding: BlobContentEncoding; filePath?: string; url?: string },
   maxDecodedBytes: number,
 ): Promise<{ payload: Buffer; filename?: string; contentType?: string }> {
@@ -151,7 +151,7 @@ async function loadBlobSource(
   }
   const url = new URL(src.url as string);
   if (url.protocol !== "https:" && url.protocol !== "http:") throw new Error("url must be http(s).");
-  const response = await fetch(url.href, { redirect: "follow" });
+  const response = await fetch(url.href, { redirect: "follow", headers: { "User-Agent": "affine-mcp-server (+https://github.com/DAWNCR0W/affine-mcp-server)" } });
   if (!response.ok) throw new Error(`Fetching url failed with HTTP ${response.status}.`);
   const payload = Buffer.from(await response.arrayBuffer());
   assertWithinDecodedLimit(payload.length, maxDecodedBytes);
@@ -206,6 +206,78 @@ function buildMultipartHeaders(
   };
 }
 
+/** Upload raw bytes to workspace blob storage and return the blob key. */
+export async function uploadBlobPayload(
+  gql: GraphQLClient,
+  uploadConfig: BlobUploadConfig,
+  workspaceId: string,
+  payload: Buffer,
+  safeFilename: string,
+  mime: string,
+): Promise<string> {
+  const { endpoint, headers } = await gql.getConnectionAuth();
+  const form = new FormData();
+  form.append("operations", JSON.stringify({
+    query: `mutation SetBlob($workspaceId: String!, $blob: Upload!) {
+      setBlob(workspaceId: $workspaceId, blob: $blob)
+    }`,
+    variables: {
+      workspaceId,
+      blob: null
+    }
+  }));
+  form.append("map", JSON.stringify({ "0": ["variables.blob"] }));
+  form.append("0", payload, { filename: safeFilename, contentType: mime });
+
+  const requestHeaders = buildMultipartHeaders(headers, form.getHeaders());
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), uploadConfig.timeoutMs);
+  try {
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: requestHeaders,
+      body: form as any,
+      signal: controller.signal,
+    });
+    const responseBody = await readLimitedResponseBody(
+      response,
+      uploadConfig.maxResponseBytes,
+      "Blob upload response",
+    );
+    let result: BlobUploadGraphQLResponse;
+    try {
+      result = parseUploadResponse(responseBody);
+    } catch (error) {
+      if (!response.ok) {
+        throw new Error(`Blob upload failed with HTTP ${response.status}.`);
+      }
+      throw error;
+    }
+
+    const graphQLError = firstGraphQLError(result);
+    if (!response.ok) {
+      const detail = graphQLError ? `: ${graphQLError}` : "";
+      throw new Error(`Blob upload failed with HTTP ${response.status}${detail}`);
+    }
+    if (graphQLError) {
+      throw new Error(graphQLError);
+    }
+    const blobKey = result.data?.setBlob;
+    if (typeof blobKey !== "string" || !blobKey.trim()) {
+      throw new Error("Upload succeeded but no blob key was returned.");
+    }
+    return blobKey;
+  } catch (error: any) {
+    if (controller.signal.aborted) {
+      throw new BlobUploadTimeoutError(uploadConfig.timeoutMs);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 export function registerBlobTools(
   server: McpServer,
   gql: GraphQLClient,
@@ -230,83 +302,23 @@ export function registerBlobTools(
     contentType?: string;
   }) => {
     try {
-      const { endpoint, headers } = await gql.getConnectionAuth();
       const source = await loadBlobSource({ content, encoding, filePath, url }, uploadConfig.maxDecodedBytes);
       const payload = source.payload;
       const safeFilename = validateMultipartMetadata(filename ?? source.filename ?? `blob-${Date.now()}.bin`, "filename");
       const mime = validateMultipartMetadata(contentType ?? source.contentType ?? "application/octet-stream", "contentType");
 
-      const form = new FormData();
-      form.append("operations", JSON.stringify({
-        query: `mutation SetBlob($workspaceId: String!, $blob: Upload!) {
-          setBlob(workspaceId: $workspaceId, blob: $blob)
-        }`,
-        variables: {
-          workspaceId,
-          blob: null
-        }
-      }));
-      form.append("map", JSON.stringify({ "0": ["variables.blob"] }));
-      form.append("0", payload, { filename: safeFilename, contentType: mime });
-
-      const requestHeaders = buildMultipartHeaders(headers, form.getHeaders());
-
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), uploadConfig.timeoutMs);
-      try {
-        const response = await fetch(endpoint, {
-          method: "POST",
-          headers: requestHeaders,
-          body: form as any,
-          signal: controller.signal,
-        });
-        const responseBody = await readLimitedResponseBody(
-          response,
-          uploadConfig.maxResponseBytes,
-          "Blob upload response",
-        );
-        let result: BlobUploadGraphQLResponse;
-        try {
-          result = parseUploadResponse(responseBody);
-        } catch (error) {
-          if (!response.ok) {
-            throw new Error(`Blob upload failed with HTTP ${response.status}.`);
-          }
-          throw error;
-        }
-
-        const graphQLError = firstGraphQLError(result);
-        if (!response.ok) {
-          const detail = graphQLError ? `: ${graphQLError}` : "";
-          throw new Error(`Blob upload failed with HTTP ${response.status}${detail}`);
-        }
-        if (graphQLError) {
-          throw new Error(graphQLError);
-        }
-        const blobKey = result.data?.setBlob;
-        if (typeof blobKey !== "string" || !blobKey.trim()) {
-          throw new Error("Upload succeeded but no blob key was returned.");
-        }
-
-        return text({
-          id: blobKey,
-          key: blobKey,
-          workspaceId,
-          filename: safeFilename,
-          contentType: mime,
-          encoding,
-          size: payload.length,
-          ...(readImageSize(payload) ?? {}),
-          uploadedAt: new Date().toISOString()
-        });
-      } catch (error: any) {
-        if (controller.signal.aborted) {
-          throw new BlobUploadTimeoutError(uploadConfig.timeoutMs);
-        }
-        throw error;
-      } finally {
-        clearTimeout(timeout);
-      }
+      const blobKey = await uploadBlobPayload(gql, uploadConfig, workspaceId, payload, safeFilename, mime);
+      return text({
+        id: blobKey,
+        key: blobKey,
+        workspaceId,
+        filename: safeFilename,
+        contentType: mime,
+        encoding,
+        size: payload.length,
+        ...(readImageSize(payload) ?? {}),
+        uploadedAt: new Date().toISOString()
+      });
     } catch (error: any) {
       return toolError(error, {
         code: error instanceof BlobUploadTimeoutError

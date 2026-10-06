@@ -105,6 +105,7 @@ const OUTPUT_SPECS = {
   get_collection: spec({ id: "string", name: "string", rules: "object", allowList: "stringArray" }),
   get_doc: spec({ id: "string", value: "null" }, true),
   get_doc_icon: receipt({ workspaceId: "string", docId: "string", icon: "icon", hasIcon: "boolean" }),
+  compose_canvas: spec({ composed: "boolean", docId: "string", layout: "string", origin: "object", ids: "object", edgeIds: "stringArray", frameIds: "stringArray", hint: "string" }),
   render_canvas: spec({ docId: "string", url: "string", bytes: "number" }),
   get_edgeless_canvas: spec({ docId: "string", exists: "boolean", surfaceBlockId: "nullableString", edgelessBlocks: "unknownArray", surfaceElements: "unknownArray", bounds: "nullableObject", elementCounts: "object" }),
   get_folder_icon: receipt({ workspaceId: "string", folderId: "string", icon: "icon", hasIcon: "boolean" }),

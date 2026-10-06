@@ -31,7 +31,7 @@ import {
 } from "../util/inputSchemas.js";
 import { secureAffineId, secureRandomInt31 } from "../util/random.js";
 import { documentRevision, isDocumentRegistered } from "../util/documentRevision.js";
-import { ensureDocumentCreator, fetchCurrentUserId, readDocumentCreator } from "../util/docCreator.js";
+import { docPropertiesDocId, ensureDocumentCreator, fetchCurrentUserId, readDocumentCreator } from "../util/docCreator.js";
 import {
   wsUrlFromGraphQLEndpoint,
   connectWorkspaceSocket,
@@ -70,7 +70,11 @@ import {
   pickFurthestInDirection,
   sortByFractionalIndex,
   stackRelativeTo,
+  layoutNodes,
+  type LayoutMode,
 } from "../edgeless/layout.js";
+import { loadBlobSource, loadBlobUploadConfig, uploadBlobPayload } from "./blobStorage.js";
+import { readImageSize } from "../util/imageSize.js";
 
 export type DocumentMoveToolContext = {
   workspaceId: string;
@@ -6637,9 +6641,44 @@ export function registerDocTools(
     revokeDocHandler as any
   );
 
+  /** Store AFFiNE's per-doc default view ("page" or "edgeless") in the docProperties sub-doc. */
+  async function setDocPrimaryMode(workspaceId: string, docId: string, mode: "page" | "edgeless", hideEmptyNotes = false): Promise<void> {
+    const { endpoint, cookie, bearer } = await getCookieAndEndpoint();
+    const socket = await connectWorkspaceSocket(wsUrlFromGraphQLEndpoint(endpoint), cookie, bearer);
+    try {
+      await joinWorkspace(socket, workspaceId);
+      const propsId = docPropertiesDocId(workspaceId);
+      const snapshot = await loadDoc(socket, workspaceId, propsId);
+      const propsDoc = new Y.Doc();
+      if (typeof snapshot.missing === "string") Y.applyUpdate(propsDoc, Buffer.from(snapshot.missing, "base64"));
+      const prevSV = Y.encodeStateVector(propsDoc);
+      const record = propsDoc.getMap(docId);
+      record.set("id", docId);
+      record.set("primaryMode", mode);
+      await pushDocUpdate(socket, workspaceId, propsId, Buffer.from(Y.encodeStateAsUpdate(propsDoc, prevSV)).toString("base64"));
+      if (hideEmptyNotes) {
+        // The seeded page note only carries the title on a whiteboard and renders
+        // taller than its stored height, so it collides with composed content.
+        const page = await loadDoc(socket, workspaceId, docId);
+        const pageDoc = new Y.Doc();
+        if (typeof page.missing === "string") Y.applyUpdate(pageDoc, Buffer.from(page.missing, "base64"));
+        const pagePrevSV = Y.encodeStateVector(pageDoc);
+        const blocks = pageDoc.getMap("blocks") as Y.Map<any>;
+        for (const [, b] of blocks.entries()) {
+          if (!(b instanceof Y.Map) || b.get("sys:flavour") !== "affine:note") continue;
+          const hasText = childIdsFrom(b.get("sys:children")).some(id => asText(blocks.get(id)?.get?.("prop:text")).trim());
+          if (!hasText) b.set("prop:displayMode", "doc");
+        }
+        await pushPageDocUpdate(socket, workspaceId, docId, Buffer.from(Y.encodeStateAsUpdate(pageDoc, pagePrevSV)).toString("base64"));
+      }
+    } finally {
+      socket.disconnect();
+    }
+  }
+
   // CREATE DOC (high-level)
   /** Create a plain-text document and return placement metadata plus recoverable warnings. */
-  const createDocHandler = async (parsed: { workspaceId?: string; title?: string; content?: string; parentDocId?: string; folderId?: string }) => {
+  const createDocHandler = async (parsed: { workspaceId?: string; title?: string; content?: string; parentDocId?: string; folderId?: string; mode?: "page" | "edgeless" }) => {
     const workspaceId = parsed.workspaceId || defaults.workspaceId;
     if (!workspaceId) {
       throw new Error("workspaceId is required. Provide it or set AFFINE_WORKSPACE_ID.");
@@ -6657,13 +6696,23 @@ export function registerDocTools(
         docId: created.docId,
         folderId: parsed.folderId,
       });
+      const modeWarnings: string[] = [];
+      if (parsed.mode === "edgeless") {
+        try {
+          await setDocPrimaryMode(created.workspaceId, created.docId, "edgeless", true);
+        } catch (error: any) {
+          modeWarnings.push(`Document created but default mode was not set to edgeless: ${error?.message ?? error}`);
+        }
+      }
       const warnings = mergeWarnings(
         created.warnings ?? [],
         placement.warnings,
         folderPlacement.warnings,
         createDocContentWarnings(parsed.content),
+        modeWarnings,
       );
       return receipt("doc.create", {
+        mode: parsed.mode ?? "page",
         workspaceId: created.workspaceId,
         docId: created.docId,
         title: created.title,
@@ -6693,6 +6742,7 @@ export function registerDocTools(
         content: z.string().optional().describe("Optional initial plain text stored as one paragraph. Use create_doc_from_markdown for structured Markdown."),
         parentDocId: z.string().optional().describe("Optional parent doc to link the new doc under in the sidebar."),
         folderId: z.string().optional().describe("Optional folder ID to place the doc in. Use list_organize_nodes to find folder IDs."),
+        mode: z.enum(["page", "edgeless"]).optional().describe("Default view when the doc is opened. Use 'edgeless' for whiteboards/boards (default 'page')."),
       },
     },
     createDocHandler as any
@@ -9648,6 +9698,46 @@ export function registerDocTools(
     valueMap.set(elementId, el);
   }
 
+  /** Build and write one surface element; connectors bound by id auto-snap to sides and get a label box. */
+  function placeSurfaceElement(
+    blocks: Y.Map<any>,
+    values: Y.Map<any>,
+    type: SurfaceElementType,
+    index: string,
+    params: SurfaceElementFields,
+  ): string {
+    const ctx = { value: values };
+    const { elementId, data } = buildSurfaceElementData(type, index, params);
+    if (type === "connector") {
+      const srcBounds = resolveConnectorEndpointBoundAsBound(ctx.value, blocks, params.sourceId);
+      const tgtBounds = resolveConnectorEndpointBoundAsBound(ctx.value, blocks, params.targetId);
+
+      // Auto-snap to the four tangent-carrying sides when the caller only
+      // supplied ids — the renderer needs tangents to draw arrow heads.
+      if (srcBounds && tgtBounds && !params.sourcePosition && !params.targetPosition) {
+        const natural = pickConnectorSides(srcBounds, tgtBounds);
+        data.source = { ...(data.source as any), position: SIDE_TO_NORMALIZED_POSITION[natural.from] };
+        data.target = { ...(data.target as any), position: SIDE_TO_NORMALIZED_POSITION[natural.to] };
+      }
+
+      if (params.label) {
+        const srcCenter = srcBounds
+          ? { x: srcBounds.x + srcBounds.w / 2, y: srcBounds.y + srcBounds.h / 2 }
+          : resolveConnectorEndpointCenter(ctx.value, blocks, params.sourceId, params.sourcePosition as [number, number] | undefined);
+        const tgtCenter = tgtBounds
+          ? { x: tgtBounds.x + tgtBounds.w / 2, y: tgtBounds.y + tgtBounds.h / 2 }
+          : resolveConnectorEndpointCenter(ctx.value, blocks, params.targetId, params.targetPosition as [number, number] | undefined);
+        const midpoint =
+          srcCenter && tgtCenter
+            ? { x: (srcCenter.x + tgtCenter.x) / 2, y: (srcCenter.y + tgtCenter.y) / 2 }
+            : (srcCenter ?? tgtCenter);
+        data.labelXYWH = estimateConnectorLabelXYWH(params.label, 16, midpoint, 280);
+      }
+    }
+    writeSurfaceElement(ctx.value, elementId, data);
+    return elementId;
+  }
+
   const addSurfaceElementHandler = async (params: AddSurfaceElementInput) => {
     const workspaceId = params.workspaceId || defaults.workspaceId;
     if (!workspaceId) {
@@ -9679,34 +9769,7 @@ export function registerDocTools(
         if (!applicable.includes(params.type)) ignored.push(field);
       }
 
-      const { elementId, data } = buildSurfaceElementData(params.type, index, params);
-      if (params.type === "connector") {
-        const srcBounds = resolveConnectorEndpointBoundAsBound(ctx.value, blocks, params.sourceId);
-        const tgtBounds = resolveConnectorEndpointBoundAsBound(ctx.value, blocks, params.targetId);
-
-        // Auto-snap to the four tangent-carrying sides when the caller only
-        // supplied ids — the renderer needs tangents to draw arrow heads.
-        if (srcBounds && tgtBounds && !params.sourcePosition && !params.targetPosition) {
-          const natural = pickConnectorSides(srcBounds, tgtBounds);
-          data.source = { ...(data.source as any), position: SIDE_TO_NORMALIZED_POSITION[natural.from] };
-          data.target = { ...(data.target as any), position: SIDE_TO_NORMALIZED_POSITION[natural.to] };
-        }
-
-        if (params.label) {
-          const srcCenter = srcBounds
-            ? { x: srcBounds.x + srcBounds.w / 2, y: srcBounds.y + srcBounds.h / 2 }
-            : resolveConnectorEndpointCenter(ctx.value, blocks, params.sourceId, params.sourcePosition as [number, number] | undefined);
-          const tgtCenter = tgtBounds
-            ? { x: tgtBounds.x + tgtBounds.w / 2, y: tgtBounds.y + tgtBounds.h / 2 }
-            : resolveConnectorEndpointCenter(ctx.value, blocks, params.targetId, params.targetPosition as [number, number] | undefined);
-          const midpoint =
-            srcCenter && tgtCenter
-              ? { x: (srcCenter.x + tgtCenter.x) / 2, y: (srcCenter.y + tgtCenter.y) / 2 }
-              : (srcCenter ?? tgtCenter);
-          data.labelXYWH = estimateConnectorLabelXYWH(params.label, 16, midpoint, 280);
-        }
-      }
-      writeSurfaceElement(ctx.value, elementId, data);
+      const elementId = placeSurfaceElement(blocks, ctx.value, params.type, index, params);
       const delta = Y.encodeStateAsUpdate(doc, prevSV);
       await pushPageDocUpdate(
         socket,
@@ -11047,6 +11110,282 @@ export function registerDocTools(
         "BlockSuite fractional-index string controlling z-order. On add, defaults to a key above every existing element's index (new elements render on top). On update, replaces the stored value — pass a key less than some existing index to send-to-back, or greater to bring-to-front. Use the value returned by list_surface_elements to pick a specific position."
       ),
   } as const;
+
+  // COMPOSE CANVAS: a whole board (nodes, edges, frames) in one call and one doc update.
+  type ComposeNode = {
+    key: string;
+    kind?: "shape" | "text" | "note" | "image";
+    text?: string;
+    markdown?: string;
+    x?: number;
+    y?: number;
+    width?: number;
+    height?: number;
+    shapeType?: "rect" | "ellipse" | "diamond" | "triangle";
+    radius?: number;
+    fillColor?: string;
+    strokeColor?: string;
+    strokeStyle?: "solid" | "dash" | "none";
+    color?: string;
+    fontSize?: number;
+    fontWeight?: string;
+    background?: string;
+    imageUrl?: string;
+    filePath?: string;
+    sourceId?: string;
+  };
+  type ComposeCanvasInput = {
+    workspaceId?: string;
+    docId: string;
+    layout?: LayoutMode | "none";
+    direction?: "right" | "down";
+    columns?: number;
+    gapX?: number;
+    gapY?: number;
+    origin?: { x: number; y: number };
+    defaults?: Omit<Partial<ComposeNode>, "key" | "x" | "y" | "text" | "markdown" | "imageUrl" | "filePath" | "sourceId">;
+    nodes: ComposeNode[];
+    edges?: Array<{ from: string; to: string; label?: string; stroke?: string; strokeStyle?: "solid" | "dash" | "none"; mode?: number; frontEndpointStyle?: string; rearEndpointStyle?: string }>;
+    frames?: Array<{ title: string; contains: string[]; background?: string }>;
+  };
+
+  // Rough text box so labels don't overflow their shape (the editor does not auto-grow shapes).
+  function defaultNodeSize(node: ComposeNode): { width: number; height: number } {
+    const kind = node.kind ?? "shape";
+    if (kind === "note") {
+      const width = node.width ?? 400;
+      return { width, height: node.height ?? estimateNoteHeightForMarkdown(node.markdown ?? node.text ?? "", width) };
+    }
+    const fontSize = node.fontSize ?? 20;
+    const lines = (node.text ?? "").split("\n");
+    const longest = Math.max(...lines.map(l => l.length));
+    const width = node.width ?? Math.min(kind === "text" ? 1600 : 420, Math.max(kind === "text" ? 120 : 200, Math.round(longest * fontSize * 0.6) + 48));
+    const charsPerLine = Math.max(1, Math.floor((width - 48) / (fontSize * 0.6)));
+    const wrapped = lines.reduce((n, l) => n + Math.max(1, Math.ceil(l.length / charsPerLine)), 0);
+    const height = node.height ?? Math.max(kind === "text" ? 40 : 100, Math.round(wrapped * fontSize * 1.4) + 40);
+    return { width, height };
+  }
+
+  function canvasContentBounds(blocks: Y.Map<any>): { minX: number; maxY: number } | null {
+    const all: Array<{ x: number; y: number; width: number; height: number }> = [];
+    const ctx = getSurfaceElementsValueMap(blocks, { create: false });
+    if (ctx) {
+      for (const [, el] of ctx.value.entries()) {
+        if (el instanceof Y.Map) {
+          const b = parseXywhString(el.get("xywh"));
+          if (b) all.push(b);
+        }
+      }
+    }
+    for (const [, b] of blocks.entries()) {
+      if (!(b instanceof Y.Map)) continue;
+      const flavour = b.get("sys:flavour");
+      if (flavour === "affine:page" || flavour === "affine:surface") continue;
+      if (flavour === "affine:note" && b.get("prop:displayMode") === "doc") continue;
+      const xywh = parseXywhString(b.get("prop:xywh"));
+      if (xywh && xywh.width > 0 && xywh.height > 0) all.push(xywh);
+    }
+    if (all.length === 0) return null;
+    return { minX: Math.min(...all.map(b => b.x)), maxY: Math.max(...all.map(b => b.y + b.height)) };
+  }
+
+  const composeCanvasHandler = async (params: ComposeCanvasInput) => {
+    const workspaceId = params.workspaceId || defaults.workspaceId;
+    if (!workspaceId) throw new Error("workspaceId is required. Provide it or set AFFINE_WORKSPACE_ID.");
+    const keys = new Set<string>();
+    for (const n of params.nodes) {
+      if (keys.has(n.key)) throw new Error(`Duplicate node key '${n.key}'.`);
+      keys.add(n.key);
+    }
+
+    const nodes = params.nodes.map(n => ({ ...params.defaults, ...n }) as ComposeNode);
+
+    // Images first: upload over HTTP before opening the doc socket, and size them from their pixels.
+    const uploadConfig = loadBlobUploadConfig();
+    for (const n of nodes) {
+      if ((n.kind ?? "shape") !== "image") continue;
+      if (!n.sourceId) {
+        if (!n.imageUrl && !n.filePath) throw new Error(`Image node '${n.key}' needs imageUrl, filePath, or sourceId.`);
+        const src = await loadBlobSource({ encoding: "utf8", url: n.imageUrl, filePath: n.filePath }, uploadConfig.maxDecodedBytes);
+        n.sourceId = await uploadBlobPayload(gql, uploadConfig, workspaceId, src.payload, src.filename ?? `image-${Date.now()}`, src.contentType ?? "application/octet-stream");
+        const natural = readImageSize(src.payload);
+        if (natural && (n.width === undefined || n.height === undefined)) {
+          const ratio = natural.height / natural.width;
+          if (n.width === undefined && n.height === undefined) n.width = Math.min(natural.width, 320);
+          if (n.width === undefined) n.width = Math.round(n.height! / ratio);
+          if (n.height === undefined) n.height = Math.round(n.width! * ratio);
+        }
+      }
+      n.width ??= 320;
+      n.height ??= 240;
+    }
+
+    const { endpoint, cookie, bearer } = await getCookieAndEndpoint();
+    const socket = await connectWorkspaceSocket(wsUrlFromGraphQLEndpoint(endpoint), cookie, bearer);
+    try {
+      await joinWorkspace(socket, workspaceId);
+      const doc = new Y.Doc();
+      const snapshot = await loadDoc(socket, workspaceId, params.docId);
+      if (!snapshot.missing) throw new Error(`Document ${params.docId} was not found in workspace ${workspaceId}.`);
+      Y.applyUpdate(doc, Buffer.from(snapshot.missing, "base64"));
+      const prevSV = Y.encodeStateVector(doc);
+      const blocks = doc.getMap("blocks") as Y.Map<any>;
+
+      // Auto-place below whatever is already on the board so nothing overlaps.
+      const existing = canvasContentBounds(blocks);
+      const origin = params.origin ?? (existing ? { x: existing.minX, y: existing.maxY + 120 } : { x: 0, y: 0 });
+      const sized = nodes.map(n => ({ node: n, ...defaultNodeSize(n) }));
+      const layoutMode = params.layout ?? ((params.edges?.length ?? 0) > 0 ? "flow" : "grid");
+      const auto = sized.filter(s => s.node.x === undefined && s.node.y === undefined);
+      const positions = layoutMode === "none"
+        ? new Map<string, { x: number; y: number }>()
+        : layoutNodes(auto.map(s => ({ key: s.node.key, width: s.width, height: s.height })), params.edges ?? [], {
+          mode: layoutMode, direction: params.direction, columns: params.columns,
+          gapX: params.gapX, gapY: params.gapY, originX: origin.x, originY: origin.y,
+        });
+
+      const ctx = getSurfaceElementsValueMap(blocks, { create: true })!;
+      const surfaceChildren = ensureChildrenArray(blocks.get(ctx.surfaceId));
+      const pageId = findBlockIdByFlavour(blocks, "affine:page");
+      if (!pageId) throw new Error("Document has no page block.");
+      const pageChildren = ensureChildrenArray(blocks.get(pageId));
+      const ids: Record<string, string> = {};
+
+      for (const { node, width, height } of sized) {
+        const pos = positions.get(node.key);
+        const x = Math.round(node.x ?? pos?.x ?? origin.x);
+        const y = Math.round(node.y ?? pos?.y ?? origin.y);
+        const kind = node.kind ?? "shape";
+        if (kind === "shape" || kind === "text") {
+          ids[node.key] = placeSurfaceElement(blocks, ctx.value, kind, nextCanvasIndex(blocks), {
+            x, y, width, height,
+            text: node.text,
+            shapeType: node.shapeType, radius: node.radius,
+            fillColor: node.fillColor, strokeColor: node.strokeColor, strokeStyle: node.strokeStyle,
+            color: node.color, fontSize: node.fontSize, fontWeight: node.fontWeight,
+          });
+          continue;
+        }
+        const normalized = normalizeAppendBlockInput({
+          workspaceId, docId: params.docId, type: kind,
+          x, y, width, height,
+          ...(kind === "note" ? { text: node.markdown ? undefined : node.text, background: node.background } : { sourceId: node.sourceId }),
+        });
+        const { blockId, block, extraBlocks } = createBlock(normalized);
+        block.set("prop:index", nextCanvasIndex(blocks));
+        if (kind === "image") block.set("prop:xywh", `[${x},${y},${width},${height}]`);
+        blocks.set(blockId, block);
+        for (const extra of extraBlocks ?? []) blocks.set(extra.blockId, extra.block);
+        (kind === "note" ? pageChildren : surfaceChildren).push([blockId]);
+        if (kind === "note" && node.markdown) {
+          applyMarkdownOperationsToDoc(doc, {
+            workspaceId, docId: params.docId,
+            operations: parseMarkdownToOperations(node.markdown).operations,
+            placement: { parentId: blockId },
+          });
+        }
+        ids[node.key] = blockId;
+      }
+
+      const idOf = (ref: string) => ids[ref] ?? ref; // unknown keys are treated as existing element/block ids
+      const edgeIds: string[] = [];
+      for (const e of params.edges ?? []) {
+        edgeIds.push(placeSurfaceElement(blocks, ctx.value, "connector", nextCanvasIndex(blocks), {
+          sourceId: idOf(e.from), targetId: idOf(e.to), label: e.label, stroke: e.stroke,
+          strokeStyle: e.strokeStyle, mode: e.mode, frontEndpointStyle: e.frontEndpointStyle, rearEndpointStyle: e.rearEndpointStyle,
+        }));
+      }
+
+      const frameIds: string[] = [];
+      for (const f of params.frames ?? []) {
+        const normalized = normalizeAppendBlockInput({
+          workspaceId, docId: params.docId, type: "frame", text: f.title,
+          childElementIds: f.contains.map(idOf), background: f.background,
+        });
+        resolveEdgelessLayoutHints(blocks, normalized);
+        const { blockId, block } = createBlock(normalized);
+        block.set("prop:index", nextCanvasIndex(blocks));
+        blocks.set(blockId, block);
+        surfaceChildren.push([blockId]);
+        frameIds.push(blockId);
+      }
+
+      const delta = Y.encodeStateAsUpdate(doc, prevSV);
+      await pushPageDocUpdate(socket, workspaceId, params.docId, Buffer.from(delta).toString("base64"));
+      return text({
+        composed: true,
+        docId: params.docId,
+        layout: layoutMode,
+        origin,
+        ids,
+        edgeIds,
+        frameIds,
+        hint: "Call render_canvas to check the result visually.",
+      });
+    } finally {
+      socket.disconnect();
+    }
+  };
+
+  const composeNodeSchema = z.object({
+    key: z.string().min(1).describe("Your own unique key for this node; edges and frames reference it."),
+    kind: z.enum(["shape", "text", "note", "image"]).optional().describe("shape (default): box with centered label. text: free-standing title/label. note: rich content card (markdown). image: picture from imageUrl/filePath/sourceId."),
+    text: z.string().optional().describe("Label (shape/text) or plain content (note). Use \\n for line breaks."),
+    markdown: z.string().optional().describe("Note only: markdown content (headings, lists, links...)."),
+    x: z.number().optional().describe("Absolute position. Omit x and y to let the layout place the node."),
+    y: z.number().optional(),
+    width: z.number().positive().optional().describe("Defaults are computed from the text length (shape/text), 400 (note), or the image's real size capped at 320px wide."),
+    height: z.number().positive().optional(),
+    shapeType: z.enum(["rect", "ellipse", "diamond", "triangle"]).optional(),
+    radius: z.number().min(0).max(1).optional().describe("Corner radius for rect shapes (0-1)."),
+    fillColor: z.string().optional().describe("AFFiNE palette token such as --affine-palette-shape-blue, or a hex color."),
+    strokeColor: z.string().optional().describe("e.g. --affine-palette-line-blue or hex."),
+    strokeStyle: z.enum(["solid", "dash", "none"]).optional(),
+    color: z.string().optional().describe("Text color (shape/text)."),
+    fontSize: z.number().positive().optional(),
+    fontWeight: z.string().optional().describe("e.g. 400, 600, 700."),
+    background: z.string().optional().describe("Note background token."),
+    imageUrl: z.string().url().optional().describe("Image only: http(s) URL to download and upload (stdio only)."),
+    filePath: z.string().optional().describe("Image only: absolute local file path (stdio only)."),
+    sourceId: z.string().optional().describe("Image only: blob key from upload_blob."),
+  });
+
+  server.registerTool(
+    "compose_canvas",
+    {
+      title: "Compose Canvas",
+      description:
+        "Build a whole edgeless board in one call: nodes (shapes, texts, notes, images), connectors between them, and frames grouping them. Nodes without x/y are auto-placed: 'flow' (default when edges exist) lays out a flowchart by edge ranks, 'grid'/'row'/'column' place them in reading order. New content goes below anything already on the board. Shape sizes are computed from their labels so text does not overflow. Returns the created ids keyed by your node keys. Follow with render_canvas to check the result.",
+      inputSchema: {
+        workspaceId: z.string().optional().describe("AFFiNE workspace id. Omit only when AFFINE_WORKSPACE_ID is configured."),
+        docId: z.string().min(1).describe("Target document (create it with create_doc mode='edgeless')."),
+        layout: z.enum(["flow", "grid", "row", "column", "none"]).optional().describe("Auto-layout for nodes without x/y. Default: flow if edges exist, else grid."),
+        direction: z.enum(["right", "down"]).optional().describe("Flow direction (default right)."),
+        columns: z.number().int().positive().optional().describe("Grid columns (default ~sqrt(n))."),
+        gapX: z.number().min(0).optional().describe("Horizontal gap between nodes (default 80)."),
+        gapY: z.number().min(0).optional().describe("Vertical gap between nodes (default 60)."),
+        origin: z.object({ x: z.number(), y: z.number() }).optional().describe("Top-left of the composed block. Default: below existing content, or 0,0 on an empty board."),
+        defaults: composeNodeSchema.omit({ key: true, x: true, y: true, text: true, markdown: true, imageUrl: true, filePath: true, sourceId: true }).partial().optional().describe("Style applied to every node unless the node overrides it (e.g. a shared fillColor/fontSize)."),
+        nodes: z.array(composeNodeSchema).min(1).max(300),
+        edges: z.array(z.object({
+          from: z.string().describe("Node key (or an existing element/block id)."),
+          to: z.string(),
+          label: z.string().optional(),
+          stroke: z.string().optional().describe("Line color token, e.g. --affine-palette-line-grey."),
+          strokeStyle: z.enum(["solid", "dash", "none"]).optional(),
+          mode: z.number().int().min(0).max(2).optional().describe("0 straight, 1 orthogonal (default), 2 curved."),
+          frontEndpointStyle: z.string().optional().describe("Arrow head at target, e.g. Arrow, Triangle, Circle, None."),
+          rearEndpointStyle: z.string().optional().describe("Arrow head at source (default None)."),
+        })).max(500).optional(),
+        frames: z.array(z.object({
+          title: z.string(),
+          contains: z.array(z.string()).min(1).describe("Node keys (or existing ids) inside the frame; the frame is sized around them."),
+          background: z.string().optional(),
+        })).max(50).optional(),
+      },
+    },
+    composeCanvasHandler as any,
+  );
 
   server.registerTool(
     "add_surface_element",

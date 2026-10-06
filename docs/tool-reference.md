@@ -134,7 +134,7 @@ check.
 
 | Tool | Purpose | Notes |
 | --- | --- | --- |
-| `create_doc` | Create a new document | `content` is stored as one plain paragraph; accepts `folderId` for immediate organize-folder placement |
+| `create_doc` | Create a new document | `mode: "edgeless"` opens it as a whiteboard by default; `content` is stored as one plain paragraph; accepts `folderId` for immediate organize-folder placement |
 | `create_doc_from_markdown` | Create a document from Markdown content | Creates native blocks, accepts `folderId` for immediate organize-folder placement, and converts `[label](LinkedPage:<docId>)` links to native inline linked-doc references |
 | `inspect_template_structure` | Inspect a template's native AFFiNE structure and native-clone support | Helps choose a clone strategy |
 | `instantiate_template_native` | Instantiate a template via native AFFiNE block cloning, with optional Markdown fallback | Higher-fidelity than Markdown-only cloning |
@@ -258,6 +258,7 @@ AFFiNE's edgeless doc has two layers: top-level edgeless blocks (`note`, `frame`
 | Tool | Purpose | Notes |
 | --- | --- | --- |
 | `get_edgeless_canvas` | Read the full canvas: edgeless blocks + surface elements with parsed `{x,y,width,height}`, aggregate `bounds`, per-type `elementCounts` | Deterministic z-order (fractional-index sorted). Note entries carry a structured `children` array of their block descendants (`flavour`, `type`, `text`, `language`, `checked`) so markdown-seeded content round-trips faithfully. |
+| `compose_canvas` | Build a whole board in one call: shapes, texts, notes, images, connectors and frames | Nodes without `x`/`y` are auto-placed (`flow` by edge ranks, or `grid`/`row`/`column`) below existing content; shape sizes follow their labels; images accept `imageUrl`/`filePath`/`sourceId`. One document update |
 | `add_surface_element` | Add a `shape`, `connector`, `text`, or `group` to the surface | Shapes: rect/ellipse/diamond/triangle with fill, stroke, and text. Connectors accept `sourceId`/`targetId` and optional `sourcePosition`/`targetPosition` relative `[x,y]` in `[0,1]`. When both endpoints are bound by id and neither position is supplied, they auto-snap to BlockSuite's four tangent-carrying side-midpoints based on relative bounds. Creates the surface block if the doc doesn't have one. |
 | `render_canvas` | Screenshot the edgeless canvas (zoomed to fit) as a PNG image | Lets the agent check layout visually after edits. Needs a local Chrome and the `playwright` package; stdio transport |
 | `list_surface_elements` | List all surface elements (optionally filter by `type` or `elementId`) | Returns raw `xywh` plus parsed `bounds` sorted by fractional `index` ascending; serializes `Y.Text` fields to plain strings. |
