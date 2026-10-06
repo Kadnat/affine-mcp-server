@@ -246,7 +246,8 @@ export function estimateConnectorLabelXYWH(
   maxWidth: number
 ): [number, number, number, number] {
   const charWidth = fontSize * 0.55;
-  const estimatedW = Math.max(16, Math.ceil(labelText.length * charWidth));
+  // + padding: the renderer pads the label box, so a tight box wraps short labels one letter per line.
+  const estimatedW = Math.max(32, Math.ceil(labelText.length * charWidth) + 16);
   const w = Math.min(estimatedW, maxWidth);
   const h = Math.ceil(fontSize + 4);
   if (!midpoint) return [0, 0, Math.max(w, 16), Math.max(h, 16)];

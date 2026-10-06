@@ -70,6 +70,34 @@ export function registerCommentTools(server: McpServer, gql: GraphQLClient, defa
     createCommentHandler as any
   );
 
+  const replyCommentHandler = async (parsed: { commentId: string; docTitle?: string; docMode?: "Page"|"Edgeless"|"page"|"edgeless"; content: any; mentions?: string[] }) => {
+    const mutation = `mutation CreateReply($input: ReplyCreateInput!){ createReply(input:$input){ id content createdAt updatedAt } }`;
+    const docMode = (parsed.docMode || 'page').toLowerCase() === 'edgeless' ? 'edgeless' : 'page';
+    const input = { commentId: parsed.commentId, content: normalizeCommentContent(parsed.content), docTitle: parsed.docTitle || "", docMode, mentions: parsed.mentions };
+    const data = await gql.request<{ createReply: any }>(mutation, { input });
+    return receipt("comment.reply", {
+      commentId: parsed.commentId,
+      replyId: data.createReply.id,
+      id: data.createReply.id,
+      reply: data.createReply,
+    });
+  };
+  server.registerTool(
+    "reply_comment",
+    {
+      title: "Reply to Comment",
+      description: "Reply inside an existing comment thread. Use list_comments to find the thread id; use create_comment to start a new thread.",
+      inputSchema: {
+        commentId: z.string().describe("Id of the top-level comment (thread) to reply to."),
+        docTitle: z.string().optional().describe("Optional document title stored with the reply metadata."),
+        docMode: z.enum(["Page","Edgeless","page","edgeless"]).optional().describe("Document surface. Defaults to page."),
+        content: CommentContent,
+        mentions: z.array(z.string()).optional().describe("Optional AFFiNE user ids to mention.")
+      }
+    },
+    replyCommentHandler as any
+  );
+
   const updateCommentHandler = async (parsed: { id: string; content: any }) => {
     try {
       const mutation = `mutation UpdateComment($input: CommentUpdateInput!){ updateComment(input:$input) }`;

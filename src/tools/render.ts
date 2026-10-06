@@ -60,10 +60,9 @@ export function registerRenderTools(server: McpServer, gql: GraphQLClient, defau
         const style = document.createElement("style");
         style.textContent = "edgeless-toolbar-widget, affine-edgeless-zoom-toolbar-widget { display: none !important; }";
         document.head.appendChild(style);
-        for (const el of document.querySelectorAll("div")) {
-          if (getComputedStyle(el).position === "fixed" && el.textContent?.trim().startsWith("Open this doc in AFFiNE app")) {
-            el.remove();
-          }
+        // Drop floating UI (app banner, toasts) that would sit over the canvas in the capture.
+        for (const el of document.querySelectorAll("body *")) {
+          if (getComputedStyle(el).position === "fixed" && !el.contains(edgeless) && !edgeless?.contains(el)) el.remove();
         }
       }, parsed.fit !== false);
       await page.waitForTimeout(800);

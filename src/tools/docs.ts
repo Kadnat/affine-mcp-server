@@ -73,7 +73,7 @@ import {
   layoutNodes,
   type LayoutMode,
 } from "../edgeless/layout.js";
-import { loadBlobSource, loadBlobUploadConfig, uploadBlobPayload } from "./blobStorage.js";
+import { contentBlobKey, loadBlobSource, loadBlobUploadConfig, uploadBlobPayload } from "./blobStorage.js";
 import { readImageSize } from "../util/imageSize.js";
 
 export type DocumentMoveToolContext = {
@@ -9868,6 +9868,121 @@ export function registerDocTools(
     rearEndpointStyle:  ["connector"],
   };
 
+  /** Apply a partial update to one surface element; returns which fields changed or did not apply. */
+  function patchSurfaceElement(el: Y.Map<any>, params: SurfaceElementFields): { changed: string[]; ignored: string[] } {
+    const elementType = el.get("type");
+    const changed: string[] = [];
+    const ignored: string[] = [];
+
+    const geomProvided =
+      params.x !== undefined ||
+      params.y !== undefined ||
+      params.width !== undefined ||
+      params.height !== undefined;
+    if (geomProvided) {
+      if (elementType === "shape" || elementType === "text") {
+        const current = parseXywhString(el.get("xywh")) ?? {
+          x: 0,
+          y: 0,
+          width: 100,
+          height: 100,
+        };
+        const nx = params.x ?? current.x;
+        const ny = params.y ?? current.y;
+        const nw = params.width ?? current.width;
+        const nh = params.height ?? current.height;
+        el.set("xywh", formatXywhString(nx, ny, nw, nh));
+        changed.push("xywh");
+      } else {
+        if (params.x !== undefined) ignored.push("x");
+        if (params.y !== undefined) ignored.push("y");
+        if (params.width !== undefined) ignored.push("width");
+        if (params.height !== undefined) ignored.push("height");
+      }
+    }
+
+    const setYText = (key: string, value: string) => {
+      const yText = new Y.Text();
+      yText.insert(0, resolveSurfaceNewlines(value));
+      el.set(key, yText);
+      changed.push(key);
+    };
+
+    if (params.text !== undefined) {
+      if (elementType === "shape" || elementType === "text" || elementType === "connector") {
+        setYText("text", params.text);
+      } else {
+        ignored.push("text");
+      }
+    }
+    if (params.label !== undefined) {
+      if (elementType === "connector") {
+        setYText("text", params.label);
+      } else {
+        ignored.push("label");
+      }
+    }
+    if (params.title !== undefined) {
+      if (elementType === "group") {
+        setYText("title", params.title);
+      } else {
+        ignored.push("title");
+      }
+    }
+
+    for (const [field, applicable] of Object.entries(FIELD_APPLICABILITY)) {
+      const key = field as keyof SurfaceElementFields;
+      if (params[key] === undefined) continue;
+      if (applicable.includes(elementType as SurfaceElementType)) {
+        el.set(field, params[key]);
+        changed.push(field);
+      } else {
+        ignored.push(field);
+      }
+    }
+
+    if (params.index !== undefined) {
+      el.set("index", params.index);
+      changed.push("index");
+    }
+
+    if (params.sourceId !== undefined || params.sourcePosition !== undefined) {
+      if (elementType === "connector") {
+        const source: Record<string, any> = {};
+        if (params.sourceId) source.id = params.sourceId;
+        if (params.sourcePosition) source.position = params.sourcePosition;
+        el.set("source", source);
+        changed.push("source");
+      } else {
+        if (params.sourceId !== undefined) ignored.push("sourceId");
+        if (params.sourcePosition !== undefined) ignored.push("sourcePosition");
+      }
+    }
+    if (params.targetId !== undefined || params.targetPosition !== undefined) {
+      if (elementType === "connector") {
+        const target: Record<string, any> = {};
+        if (params.targetId) target.id = params.targetId;
+        if (params.targetPosition) target.position = params.targetPosition;
+        el.set("target", target);
+        changed.push("target");
+      } else {
+        if (params.targetId !== undefined) ignored.push("targetId");
+        if (params.targetPosition !== undefined) ignored.push("targetPosition");
+      }
+    }
+    if (params.children !== undefined) {
+      if (elementType === "group") {
+        const childMap = new Y.Map<boolean>();
+        for (const childId of params.children) childMap.set(childId, true);
+        el.set("children", childMap);
+        changed.push("children");
+      } else {
+        ignored.push("children");
+      }
+    }
+    return { changed, ignored };
+  }
+
   const updateSurfaceElementHandler = async (params: UpdateSurfaceElementInput) => {
     const workspaceId = params.workspaceId || defaults.workspaceId;
     if (!workspaceId) {
@@ -9897,115 +10012,7 @@ export function registerDocTools(
       }
 
       const elementType = el.get("type");
-      const changed: string[] = [];
-      const ignored: string[] = [];
-
-      const geomProvided =
-        params.x !== undefined ||
-        params.y !== undefined ||
-        params.width !== undefined ||
-        params.height !== undefined;
-      if (geomProvided) {
-        if (elementType === "shape" || elementType === "text") {
-          const current = parseXywhString(el.get("xywh")) ?? {
-            x: 0,
-            y: 0,
-            width: 100,
-            height: 100,
-          };
-          const nx = params.x ?? current.x;
-          const ny = params.y ?? current.y;
-          const nw = params.width ?? current.width;
-          const nh = params.height ?? current.height;
-          el.set("xywh", formatXywhString(nx, ny, nw, nh));
-          changed.push("xywh");
-        } else {
-          if (params.x !== undefined) ignored.push("x");
-          if (params.y !== undefined) ignored.push("y");
-          if (params.width !== undefined) ignored.push("width");
-          if (params.height !== undefined) ignored.push("height");
-        }
-      }
-
-      const setYText = (key: string, value: string) => {
-        const yText = new Y.Text();
-        yText.insert(0, resolveSurfaceNewlines(value));
-        el.set(key, yText);
-        changed.push(key);
-      };
-
-      if (params.text !== undefined) {
-        if (elementType === "shape" || elementType === "text" || elementType === "connector") {
-          setYText("text", params.text);
-        } else {
-          ignored.push("text");
-        }
-      }
-      if (params.label !== undefined) {
-        if (elementType === "connector") {
-          setYText("text", params.label);
-        } else {
-          ignored.push("label");
-        }
-      }
-      if (params.title !== undefined) {
-        if (elementType === "group") {
-          setYText("title", params.title);
-        } else {
-          ignored.push("title");
-        }
-      }
-
-      for (const [field, applicable] of Object.entries(FIELD_APPLICABILITY)) {
-        const key = field as keyof SurfaceElementFields;
-        if (params[key] === undefined) continue;
-        if (applicable.includes(elementType as SurfaceElementType)) {
-          el.set(field, params[key]);
-          changed.push(field);
-        } else {
-          ignored.push(field);
-        }
-      }
-
-      if (params.index !== undefined) {
-        el.set("index", params.index);
-        changed.push("index");
-      }
-
-      if (params.sourceId !== undefined || params.sourcePosition !== undefined) {
-        if (elementType === "connector") {
-          const source: Record<string, any> = {};
-          if (params.sourceId) source.id = params.sourceId;
-          if (params.sourcePosition) source.position = params.sourcePosition;
-          el.set("source", source);
-          changed.push("source");
-        } else {
-          if (params.sourceId !== undefined) ignored.push("sourceId");
-          if (params.sourcePosition !== undefined) ignored.push("sourcePosition");
-        }
-      }
-      if (params.targetId !== undefined || params.targetPosition !== undefined) {
-        if (elementType === "connector") {
-          const target: Record<string, any> = {};
-          if (params.targetId) target.id = params.targetId;
-          if (params.targetPosition) target.position = params.targetPosition;
-          el.set("target", target);
-          changed.push("target");
-        } else {
-          if (params.targetId !== undefined) ignored.push("targetId");
-          if (params.targetPosition !== undefined) ignored.push("targetPosition");
-        }
-      }
-      if (params.children !== undefined) {
-        if (elementType === "group") {
-          const childMap = new Y.Map<boolean>();
-          for (const childId of params.children) childMap.set(childId, true);
-          el.set("children", childMap);
-          changed.push("children");
-        } else {
-          ignored.push("children");
-        }
-      }
+      const { changed, ignored } = patchSurfaceElement(el, params);
 
       if (changed.length > 0) {
         const delta = Y.encodeStateAsUpdate(doc, prevSV);
@@ -11113,7 +11120,9 @@ export function registerDocTools(
 
   // COMPOSE CANVAS: a whole board (nodes, edges, frames) in one call and one doc update.
   type ComposeNode = {
-    key: string;
+    key?: string;
+    id?: string;
+    deleted?: boolean;
     kind?: "shape" | "text" | "note" | "image";
     text?: string;
     markdown?: string;
@@ -11144,8 +11153,8 @@ export function registerDocTools(
     gapY?: number;
     origin?: { x: number; y: number };
     defaults?: Omit<Partial<ComposeNode>, "key" | "x" | "y" | "text" | "markdown" | "imageUrl" | "filePath" | "sourceId">;
-    nodes: ComposeNode[];
-    edges?: Array<{ from: string; to: string; label?: string; stroke?: string; strokeStyle?: "solid" | "dash" | "none"; mode?: number; frontEndpointStyle?: string; rearEndpointStyle?: string }>;
+    nodes?: ComposeNode[];
+    edges?: Array<{ id?: string; deleted?: boolean; from?: string; to?: string; label?: string; stroke?: string; strokeStyle?: "solid" | "dash" | "none"; mode?: number; frontEndpointStyle?: string; rearEndpointStyle?: string }>;
     frames?: Array<{ title: string; contains: string[]; background?: string }>;
   };
 
@@ -11189,16 +11198,117 @@ export function registerDocTools(
     return { minX: Math.min(...all.map(b => b.x)), maxY: Math.max(...all.map(b => b.y + b.height)) };
   }
 
+  /** compose_canvas edit mode: patch or delete existing elements/blocks by id (Miro-style sparse updates). */
+  function applyComposePatches(
+    blocks: Y.Map<any>,
+    values: Y.Map<any>,
+    nodes: ComposeNode[],
+    edges: NonNullable<ComposeCanvasInput["edges"]>,
+    removed: string[],
+    updated: Array<{ id: string; changed: string[]; ignored: string[] }>,
+  ): void {
+    const toDelete = new Set<string>();
+    for (const item of [...nodes, ...edges]) if (item.deleted) toDelete.add(item.id!);
+
+    for (const n of nodes) {
+      if (n.deleted) continue;
+      const id = n.id!;
+      const el = values.get(id);
+      if (el instanceof Y.Map) {
+        updated.push({ id, ...patchSurfaceElement(el, {
+          x: n.x, y: n.y, width: n.width, height: n.height, text: n.text,
+          shapeType: n.shapeType, radius: n.radius, fillColor: n.fillColor, strokeColor: n.strokeColor,
+          strokeStyle: n.strokeStyle, color: n.color, fontSize: n.fontSize, fontWeight: n.fontWeight,
+        }) });
+        continue;
+      }
+      const block = blocks.get(id);
+      if (!(block instanceof Y.Map)) throw new Error(`No element or block with id '${id}' on this board.`);
+      const changed: string[] = [];
+      const ignored: string[] = [];
+      if (n.x !== undefined || n.y !== undefined || n.width !== undefined || n.height !== undefined) {
+        const cur = parseXywhString(block.get("prop:xywh")) ?? { x: 0, y: 0, width: 100, height: 100 };
+        block.set("prop:xywh", formatXywhString(n.x ?? cur.x, n.y ?? cur.y, n.width ?? cur.width, n.height ?? cur.height));
+        changed.push("xywh");
+      }
+      if (n.background !== undefined) { block.set("prop:background", n.background); changed.push("background"); }
+      if (n.text !== undefined) {
+        if (block.get("sys:flavour") === "affine:frame") { block.set("prop:title", makeText(n.text)); changed.push("title"); }
+        else ignored.push("text");
+      }
+      for (const f of ["markdown", "shapeType", "fillColor", "strokeColor", "fontSize"] as const) if (n[f] !== undefined) ignored.push(f);
+      updated.push({ id, changed, ignored });
+    }
+
+    for (const e of edges) {
+      if (e.deleted) continue;
+      const el = values.get(e.id!);
+      if (!(el instanceof Y.Map) || el.get("type") !== "connector") throw new Error(`No connector with id '${e.id}'.`);
+      updated.push({ id: e.id!, ...patchSurfaceElement(el, {
+        label: e.label, stroke: e.stroke, strokeStyle: e.strokeStyle, mode: e.mode,
+        frontEndpointStyle: e.frontEndpointStyle, rearEndpointStyle: e.rearEndpointStyle,
+        ...(e.from ? { sourceId: e.from } : {}), ...(e.to ? { targetId: e.to } : {}),
+      }) });
+      // A label only renders once it has a box; place it at the connector's midpoint.
+      if (e.label && !el.get("labelXYWH")) {
+        const src = resolveConnectorEndpointBoundAsBound(values, blocks, (el.get("source") as any)?.id);
+        const tgt = resolveConnectorEndpointBoundAsBound(values, blocks, (el.get("target") as any)?.id);
+        if (src && tgt) {
+          const mid = { x: (src.x + src.w / 2 + tgt.x + tgt.w / 2) / 2, y: (src.y + src.h / 2 + tgt.y + tgt.h / 2) / 2 };
+          el.set("labelXYWH", estimateConnectorLabelXYWH(e.label, 16, mid, 280));
+        }
+      }
+    }
+
+    if (toDelete.size === 0) return;
+    for (const id of toDelete) {
+      if (!values.has(id) && !(blocks.get(id) instanceof Y.Map)) throw new Error(`No element or block with id '${id}' to delete.`);
+    }
+    const blockIds = collectDescendantBlockIds(blocks, [...toDelete].filter(id => blocks.get(id) instanceof Y.Map));
+    for (const id of blockIds) {
+      if (blocks.get(id)?.get?.("sys:flavour") === "affine:page") throw new Error("Refusing to delete the page root.");
+    }
+    const gone = new Set<string>([...toDelete, ...blockIds]);
+    for (const id of blockIds) blocks.delete(id);
+    for (const id of toDelete) values.delete(id);
+    // Drop dangling references: parent children lists, frame membership, connectors to removed items.
+    for (const [, b] of blocks.entries()) {
+      if (!(b instanceof Y.Map)) continue;
+      const kids = b.get("sys:children");
+      if (kids instanceof Y.Array) {
+        const arr = kids.toArray();
+        for (let i = arr.length - 1; i >= 0; i--) if (gone.has(arr[i])) kids.delete(i, 1);
+      }
+      const owned = b.get("prop:childElementIds");
+      if (owned instanceof Y.Map) for (const id of [...owned.keys()]) if (gone.has(id)) owned.delete(id);
+    }
+    for (const [id, el] of [...values.entries()]) {
+      if (!(el instanceof Y.Map) || el.get("type") !== "connector") continue;
+      const src = (el.get("source") as any)?.id;
+      const tgt = (el.get("target") as any)?.id;
+      if (gone.has(src) || gone.has(tgt)) { values.delete(id); gone.add(id); }
+    }
+    removed.push(...gone);
+  }
+
   const composeCanvasHandler = async (params: ComposeCanvasInput) => {
     const workspaceId = params.workspaceId || defaults.workspaceId;
     if (!workspaceId) throw new Error("workspaceId is required. Provide it or set AFFINE_WORKSPACE_ID.");
     const keys = new Set<string>();
-    for (const n of params.nodes) {
+    const allNodes = params.nodes ?? [];
+    for (const n of allNodes) {
+      if (n.id) continue;
+      if (!n.key) throw new Error("New nodes need a key (nodes with an id update or delete existing elements).");
       if (keys.has(n.key)) throw new Error(`Duplicate node key '${n.key}'.`);
       keys.add(n.key);
     }
+    for (const e of params.edges ?? []) {
+      if (!e.id && (!e.from || !e.to)) throw new Error("New edges need from and to.");
+    }
 
-    const nodes = params.nodes.map(n => ({ ...params.defaults, ...n }) as ComposeNode);
+    // Nodes carrying an id patch or delete what is already on the board; the rest are created.
+    const patches = allNodes.filter(n => n.id);
+    const nodes = allNodes.filter(n => !n.id).map(n => ({ ...params.defaults, ...n }) as ComposeNode);
 
     // Images first: upload over HTTP before opening the doc socket, and size them from their pixels.
     const uploadConfig = loadBlobUploadConfig();
@@ -11207,7 +11317,7 @@ export function registerDocTools(
       if (!n.sourceId) {
         if (!n.imageUrl && !n.filePath) throw new Error(`Image node '${n.key}' needs imageUrl, filePath, or sourceId.`);
         const src = await loadBlobSource({ encoding: "utf8", url: n.imageUrl, filePath: n.filePath }, uploadConfig.maxDecodedBytes);
-        n.sourceId = await uploadBlobPayload(gql, uploadConfig, workspaceId, src.payload, src.filename ?? `image-${Date.now()}`, src.contentType ?? "application/octet-stream");
+        n.sourceId = await uploadBlobPayload(gql, uploadConfig, workspaceId, src.payload, contentBlobKey(src.payload), src.contentType ?? "application/octet-stream");
         const natural = readImageSize(src.payload);
         if (natural && (n.width === undefined || n.height === undefined)) {
           const ratio = natural.height / natural.width;
@@ -11235,11 +11345,12 @@ export function registerDocTools(
       const existing = canvasContentBounds(blocks);
       const origin = params.origin ?? (existing ? { x: existing.minX, y: existing.maxY + 120 } : { x: 0, y: 0 });
       const sized = nodes.map(n => ({ node: n, ...defaultNodeSize(n) }));
+      // ponytail: patched nodes keep their place; only new nodes go through layout.
       const layoutMode = params.layout ?? ((params.edges?.length ?? 0) > 0 ? "flow" : "grid");
       const auto = sized.filter(s => s.node.x === undefined && s.node.y === undefined);
       const positions = layoutMode === "none"
         ? new Map<string, { x: number; y: number }>()
-        : layoutNodes(auto.map(s => ({ key: s.node.key, width: s.width, height: s.height })), params.edges ?? [], {
+        : layoutNodes(auto.map(s => ({ key: s.node.key!, width: s.width, height: s.height })), (params.edges ?? []).filter(e => !e.id) as Array<{ from: string; to: string }>, {
           mode: layoutMode, direction: params.direction, columns: params.columns,
           gapX: params.gapX, gapY: params.gapY, originX: origin.x, originY: origin.y,
         });
@@ -11250,14 +11361,23 @@ export function registerDocTools(
       if (!pageId) throw new Error("Document has no page block.");
       const pageChildren = ensureChildrenArray(blocks.get(pageId));
       const ids: Record<string, string> = {};
+      const removed: string[] = [];
+      const updated: Array<{ id: string; changed: string[]; ignored: string[] }> = [];
+      applyComposePatches(blocks, ctx.value, patches, (params.edges ?? []).filter(e => e.id), removed, updated);
+
+      // Z-order: new connectors first (behind), then nodes, then frames, all above existing content.
+      const newEdges = (params.edges ?? []).filter(e => !e.id);
+      let cursor: string | null = null;
+      const nextIndex = () => (cursor = cursor === null ? nextCanvasIndex(blocks) : generateKeyBetween(cursor, null));
+      const edgeIndices = newEdges.map(() => nextIndex());
 
       for (const { node, width, height } of sized) {
-        const pos = positions.get(node.key);
+        const pos = positions.get(node.key!);
         const x = Math.round(node.x ?? pos?.x ?? origin.x);
         const y = Math.round(node.y ?? pos?.y ?? origin.y);
         const kind = node.kind ?? "shape";
         if (kind === "shape" || kind === "text") {
-          ids[node.key] = placeSurfaceElement(blocks, ctx.value, kind, nextCanvasIndex(blocks), {
+          ids[node.key!] = placeSurfaceElement(blocks, ctx.value, kind, nextIndex(), {
             x, y, width, height,
             text: node.text,
             shapeType: node.shapeType, radius: node.radius,
@@ -11272,7 +11392,7 @@ export function registerDocTools(
           ...(kind === "note" ? { text: node.markdown ? undefined : node.text, background: node.background } : { sourceId: node.sourceId }),
         });
         const { blockId, block, extraBlocks } = createBlock(normalized);
-        block.set("prop:index", nextCanvasIndex(blocks));
+        block.set("prop:index", nextIndex());
         if (kind === "image") block.set("prop:xywh", `[${x},${y},${width},${height}]`);
         blocks.set(blockId, block);
         for (const extra of extraBlocks ?? []) blocks.set(extra.blockId, extra.block);
@@ -11284,17 +11404,18 @@ export function registerDocTools(
             placement: { parentId: blockId },
           });
         }
-        ids[node.key] = blockId;
+        ids[node.key!] = blockId;
       }
 
       const idOf = (ref: string) => ids[ref] ?? ref; // unknown keys are treated as existing element/block ids
       const edgeIds: string[] = [];
-      for (const e of params.edges ?? []) {
-        edgeIds.push(placeSurfaceElement(blocks, ctx.value, "connector", nextCanvasIndex(blocks), {
-          sourceId: idOf(e.from), targetId: idOf(e.to), label: e.label, stroke: e.stroke,
-          strokeStyle: e.strokeStyle, mode: e.mode, frontEndpointStyle: e.frontEndpointStyle, rearEndpointStyle: e.rearEndpointStyle,
+      newEdges.forEach((e, i) => {
+        edgeIds.push(placeSurfaceElement(blocks, ctx.value, "connector", edgeIndices[i], {
+          sourceId: idOf(e.from!), targetId: idOf(e.to!), label: e.label, stroke: e.stroke,
+          // Orthogonal routing by default: curved connectors read as messy in processes and trees.
+          strokeStyle: e.strokeStyle, mode: e.mode ?? 1, frontEndpointStyle: e.frontEndpointStyle, rearEndpointStyle: e.rearEndpointStyle,
         }));
-      }
+      });
 
       const frameIds: string[] = [];
       for (const f of params.frames ?? []) {
@@ -11304,7 +11425,7 @@ export function registerDocTools(
         });
         resolveEdgelessLayoutHints(blocks, normalized);
         const { blockId, block } = createBlock(normalized);
-        block.set("prop:index", nextCanvasIndex(blocks));
+        block.set("prop:index", nextIndex());
         blocks.set(blockId, block);
         surfaceChildren.push([blockId]);
         frameIds.push(blockId);
@@ -11320,6 +11441,8 @@ export function registerDocTools(
         ids,
         edgeIds,
         frameIds,
+        updated,
+        removed,
         hint: "Call render_canvas to check the result visually.",
       });
     } finally {
@@ -11328,7 +11451,9 @@ export function registerDocTools(
   };
 
   const composeNodeSchema = z.object({
-    key: z.string().min(1).describe("Your own unique key for this node; edges and frames reference it."),
+    key: z.string().min(1).optional().describe("Your own unique key for a NEW node; edges and frames reference it. Required unless id is set."),
+    id: z.string().min(1).optional().describe("EDIT MODE: id of an existing element/block (from a previous compose_canvas result, get_edgeless_canvas or search_canvas). Only the fields you send change."),
+    deleted: z.boolean().optional().describe("With id: delete that element/block (connectors attached to it are removed too). Confirm deletions with the user first."),
     kind: z.enum(["shape", "text", "note", "image"]).optional().describe("shape (default): box with centered label. text: free-standing title/label. note: rich content card (markdown). image: picture from imageUrl/filePath/sourceId."),
     text: z.string().optional().describe("Label (shape/text) or plain content (note). Use \\n for line breaks."),
     markdown: z.string().optional().describe("Note only: markdown content (headings, lists, links...)."),
@@ -11355,7 +11480,7 @@ export function registerDocTools(
     {
       title: "Compose Canvas",
       description:
-        "Build a whole edgeless board in one call: nodes (shapes, texts, notes, images), connectors between them, and frames grouping them. Nodes without x/y are auto-placed: 'flow' (default when edges exist) lays out a flowchart by edge ranks, 'grid'/'row'/'column' place them in reading order. New content goes below anything already on the board. Shape sizes are computed from their labels so text does not overflow. Returns the created ids keyed by your node keys. Follow with render_canvas to check the result.",
+        "Build a whole edgeless board in one call: nodes (shapes, texts, notes, images), connectors between them, and frames grouping them. Nodes without x/y are auto-placed: 'flow' (default when edges exist) lays out a flowchart by edge ranks, 'grid'/'row'/'column' place them in reading order. New content goes below anything already on the board. Shape sizes are computed from their labels so text does not overflow. Returns the created ids keyed by your node keys. EDIT MODE (like Miro's canvas_update_from_svg): pass nodes/edges with an existing id and only the fields to change; add deleted=true to remove one; items without id are created. Updates are sparse and additive: omitting an element never deletes it. Read get_canvas_guide first for layout and style rules, and follow with render_canvas to check the result.",
       inputSchema: {
         workspaceId: z.string().optional().describe("AFFiNE workspace id. Omit only when AFFINE_WORKSPACE_ID is configured."),
         docId: z.string().min(1).describe("Target document (create it with create_doc mode='edgeless')."),
@@ -11366,10 +11491,12 @@ export function registerDocTools(
         gapY: z.number().min(0).optional().describe("Vertical gap between nodes (default 60)."),
         origin: z.object({ x: z.number(), y: z.number() }).optional().describe("Top-left of the composed block. Default: below existing content, or 0,0 on an empty board."),
         defaults: composeNodeSchema.omit({ key: true, x: true, y: true, text: true, markdown: true, imageUrl: true, filePath: true, sourceId: true }).partial().optional().describe("Style applied to every node unless the node overrides it (e.g. a shared fillColor/fontSize)."),
-        nodes: z.array(composeNodeSchema).min(1).max(300),
+        nodes: z.array(composeNodeSchema).max(300).default([]),
         edges: z.array(z.object({
-          from: z.string().describe("Node key (or an existing element/block id)."),
-          to: z.string(),
+          id: z.string().optional().describe("EDIT MODE: existing connector id to update (or delete with deleted=true)."),
+          deleted: z.boolean().optional(),
+          from: z.string().optional().describe("Node key (or an existing element/block id). Required for new edges."),
+          to: z.string().optional(),
           label: z.string().optional(),
           stroke: z.string().optional().describe("Line color token, e.g. --affine-palette-line-grey."),
           strokeStyle: z.enum(["solid", "dash", "none"]).optional(),
@@ -11385,6 +11512,129 @@ export function registerDocTools(
       },
     },
     composeCanvasHandler as any,
+  );
+
+  // SEARCH CANVAS: find before you read (overview of frames, text matches, or everything in a region).
+  type CanvasItem = { id: string; kind: string; text: string; bounds: { x: number; y: number; width: number; height: number } | null; frameId?: string; fontSize?: number };
+
+  function collectCanvasItems(blocks: Y.Map<any>): CanvasItem[] {
+    const items: CanvasItem[] = [];
+    const subtreeText = (id: string): string => {
+      const b = blocks.get(id);
+      if (!(b instanceof Y.Map)) return "";
+      return [asText(b.get("prop:text")), ...childIdsFrom(b.get("sys:children")).map(subtreeText)].filter(Boolean).join("\n");
+    };
+    const ctx = getSurfaceElementsValueMap(blocks, { create: false });
+    if (ctx) {
+      for (const [id, el] of ctx.value.entries()) {
+        if (!(el instanceof Y.Map)) continue;
+        items.push({
+          id: String(id),
+          kind: String(el.get("type")),
+          text: asText(el.get("text")) || asText(el.get("title")),
+          bounds: parseXywhString(el.get("xywh")),
+          ...(typeof el.get("fontSize") === "number" ? { fontSize: el.get("fontSize") } : {}),
+        });
+      }
+    }
+    const surfaceId = findBlockIdByFlavour(blocks, "affine:surface");
+    const onSurface = new Set(surfaceId ? childIdsFrom(blocks.get(surfaceId)?.get("sys:children")) : []);
+    for (const [id, b] of blocks.entries()) {
+      if (!(b instanceof Y.Map)) continue;
+      const flavour = String(b.get("sys:flavour"));
+      const isNote = flavour === "affine:note" && b.get("prop:displayMode") !== "doc";
+      if (!isNote && !onSurface.has(String(id))) continue;
+      const text = flavour === "affine:frame" ? asText(b.get("prop:title"))
+        : flavour === "affine:image" ? String(b.get("prop:caption") ?? "")
+        : subtreeText(String(id));
+      items.push({ id: String(id), kind: flavour.replace("affine:", ""), text, bounds: parseXywhString(b.get("prop:xywh")) });
+    }
+    const frameOf = new Map<string, string>();
+    for (const it of items) {
+      if (it.kind !== "frame") continue;
+      const owned = blocks.get(it.id)?.get("prop:childElementIds");
+      if (owned instanceof Y.Map) for (const k of owned.keys()) frameOf.set(k, it.id);
+    }
+    for (const it of items) if (frameOf.has(it.id)) it.frameId = frameOf.get(it.id);
+    return items;
+  }
+
+  const searchCanvasHandler = async (params: {
+    workspaceId?: string;
+    docId: string;
+    mode?: "overview" | "matches";
+    query?: string | string[];
+    scope?: { x: number; y: number; width: number; height: number };
+    kinds?: string[];
+    limit?: number;
+  }) => {
+    const workspaceId = params.workspaceId || defaults.workspaceId;
+    if (!workspaceId) throw new Error("workspaceId is required. Provide it or set AFFINE_WORKSPACE_ID.");
+    const { endpoint, cookie, bearer } = await getCookieAndEndpoint();
+    const socket = await connectWorkspaceSocket(wsUrlFromGraphQLEndpoint(endpoint), cookie, bearer);
+    try {
+      await joinWorkspace(socket, workspaceId);
+      const snapshot = await loadDoc(socket, workspaceId, params.docId);
+      if (!snapshot.missing) throw new Error(`Document ${params.docId} was not found in workspace ${workspaceId}.`);
+      const doc = new Y.Doc();
+      Y.applyUpdate(doc, Buffer.from(snapshot.missing, "base64"));
+      const items = collectCanvasItems(doc.getMap("blocks") as Y.Map<any>);
+      const withBounds = items.filter(i => i.bounds);
+      const bounds = withBounds.length ? {
+        x: Math.min(...withBounds.map(i => i.bounds!.x)),
+        y: Math.min(...withBounds.map(i => i.bounds!.y)),
+        maxX: Math.max(...withBounds.map(i => i.bounds!.x + i.bounds!.width)),
+        maxY: Math.max(...withBounds.map(i => i.bounds!.y + i.bounds!.height)),
+      } : null;
+      const counts: Record<string, number> = {};
+      for (const i of items) counts[i.kind] = (counts[i.kind] ?? 0) + 1;
+
+      if ((params.mode ?? (params.query || params.scope ? "matches" : "overview")) === "overview") {
+        const frames = items.filter(i => i.kind === "frame").map(f => ({
+          id: f.id, title: f.text, bounds: f.bounds, members: items.filter(i => i.frameId === f.id).length,
+        }));
+        // Big standalone texts are the board's headings.
+        const headings = items.filter(i => i.kind === "text" && (i.fontSize ?? 0) >= 28)
+          .map(i => ({ id: i.id, text: i.text, bounds: i.bounds }));
+        return text({ docId: params.docId, mode: "overview", bounds, counts, frames, headings, unframed: items.filter(i => !i.frameId && i.kind !== "frame").length });
+      }
+
+      const queries = (Array.isArray(params.query) ? params.query : params.query ? [params.query] : []).map(q => q.toLowerCase());
+      const s = params.scope;
+      const matches = items.filter(i =>
+        (queries.length === 0 || queries.some(q => i.text.toLowerCase().includes(q))) &&
+        (!params.kinds?.length || params.kinds.includes(i.kind)) &&
+        (!s || (i.bounds && i.bounds.x < s.x + s.width && i.bounds.x + i.bounds.width > s.x && i.bounds.y < s.y + s.height && i.bounds.y + i.bounds.height > s.y)),
+      );
+      const limit = params.limit ?? 50;
+      return text({
+        docId: params.docId,
+        mode: "matches",
+        total: matches.length,
+        truncated: matches.length > limit,
+        matches: matches.slice(0, limit).map(i => ({ ...i, text: i.text.length > 300 ? i.text.slice(0, 300) + "…" : i.text })),
+      });
+    } finally {
+      socket.disconnect();
+    }
+  };
+
+  server.registerTool(
+    "search_canvas",
+    {
+      title: "Search Canvas",
+      description: "Find things on an edgeless board without reading all of it. mode='overview' (default with no query/scope): bounds, element counts, frames with titles and member counts, big headings. mode='matches': elements whose text contains query (case-insensitive, any of several strings), optionally limited to a scope rectangle and to kinds (shape, text, connector, note, frame, image...). Use the returned ids with compose_canvas edit mode.",
+      inputSchema: {
+        workspaceId: z.string().optional().describe("AFFiNE workspace id. Omit only when AFFINE_WORKSPACE_ID is configured."),
+        docId: z.string().min(1),
+        mode: z.enum(["overview", "matches"]).optional(),
+        query: z.union([z.string().min(1), z.array(z.string().min(1)).max(20)]).optional().describe("Text to look for; an array matches any of the strings."),
+        scope: z.object({ x: z.number(), y: z.number(), width: z.number().positive(), height: z.number().positive() }).optional().describe("Only items intersecting this canvas rectangle. With no query, returns everything in the region."),
+        kinds: z.array(z.string()).optional().describe("Filter by kind, e.g. ['shape','note']."),
+        limit: z.number().int().min(1).max(500).optional().describe("Max matches returned (default 50)."),
+      },
+    },
+    searchCanvasHandler as any,
   );
 
   server.registerTool(

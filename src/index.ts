@@ -13,6 +13,8 @@ import { registerUserCRUDTools } from "./tools/userCRUD.js";
 import { registerBlobTools } from "./tools/blobStorage.js";
 import { registerNotificationTools } from "./tools/notifications.js";
 import { registerRenderTools } from "./tools/render.js";
+import { registerSharingTools } from "./tools/sharing.js";
+import { registerGuideTools } from "./tools/guide.js";
 import { AuthSession, parseLoginMode } from "./authSession.js";
 import { registerAuthTools } from "./tools/auth.js";
 import { registerOrganizeTools } from "./tools/organize.js";
@@ -205,6 +207,8 @@ async function buildServer() {
   registerBlobTools(server, gql);
   registerNotificationTools(server, gql);
   registerRenderTools(server, gql, { workspaceId: config.defaultWorkspaceId });
+  registerSharingTools(server, gql, { workspaceId: config.defaultWorkspaceId });
+  registerGuideTools(server);
   stripSchemaDialect(server);
   return server;
 }

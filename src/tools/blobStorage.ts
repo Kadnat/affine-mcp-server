@@ -7,6 +7,7 @@ import fetch from "node-fetch";
 import { requireMatchingConfirmation } from "../util/inputSchemas.js";
 import { readLimitedResponseBody } from "../util/httpResponse.js";
 import { readImageSize } from "../util/imageSize.js";
+import { createHash } from "node:crypto";
 
 export type BlobContentEncoding = "utf8" | "base64";
 
@@ -124,6 +125,12 @@ const MIME_BY_EXT: Record<string, string> = {
   png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif",
   webp: "image/webp", svg: "image/svg+xml", pdf: "application/pdf",
 };
+
+// AFFiNE stores a blob under its upload filename, so two files both named "logo.png"
+// would overwrite each other. Like the AFFiNE app, key blobs by a content hash instead.
+export function contentBlobKey(payload: Buffer): string {
+  return createHash("sha256").update(payload).digest("base64url");
+}
 
 function guessMime(name: string): string | undefined {
   return MIME_BY_EXT[name.split(".").pop()?.toLowerCase() ?? ""];
@@ -304,7 +311,7 @@ export function registerBlobTools(
     try {
       const source = await loadBlobSource({ content, encoding, filePath, url }, uploadConfig.maxDecodedBytes);
       const payload = source.payload;
-      const safeFilename = validateMultipartMetadata(filename ?? source.filename ?? `blob-${Date.now()}.bin`, "filename");
+      const safeFilename = validateMultipartMetadata(filename ?? contentBlobKey(payload), "filename");
       const mime = validateMultipartMetadata(contentType ?? source.contentType ?? "application/octet-stream", "contentType");
 
       const blobKey = await uploadBlobPayload(gql, uploadConfig, workspaceId, payload, safeFilename, mime);
@@ -345,11 +352,39 @@ export function registerBlobTools(
         filePath: z.string().min(1).optional().describe("Absolute path of a local file to upload (stdio transport only). Filename and MIME type are inferred."),
         url: z.string().url().optional().describe("http(s) URL to download and upload (stdio transport only). Filename and MIME type are inferred."),
         encoding: z.enum(["utf8", "base64"]).default("utf8").describe("Content encoding. Defaults to utf8; use base64 explicitly for binary data."),
-        filename: z.string().min(1).max(255).optional().describe("Optional filename stored with the upload. Defaults to a generated .bin name."),
+        filename: z.string().min(1).max(255).optional().describe("Optional filename. AFFiNE uses it as the blob key, so the same name overwrites the previous blob. Defaults to a hash of the content (recommended)."),
         contentType: z.string().min(1).max(255).optional().describe("Optional MIME type. Defaults to application/octet-stream.")
       }
     },
     uploadBlobHandler as any
+  );
+
+  // GET BLOB: read an uploaded file back (e.g. an image placed on a board) so the agent can look at it.
+  server.registerTool(
+    "get_blob",
+    {
+      title: "Get Blob",
+      description: "Read a workspace blob by key (e.g. an image's sourceId from get_edgeless_canvas). Returns its URL, MIME type, size and image width/height; images up to 5 MB are also returned as image content so you can see them.",
+      inputSchema: {
+        workspaceId: z.string().describe("AFFiNE workspace id that owns the blob."),
+        key: z.string().min(1).describe("Blob key (image/attachment sourceId)."),
+        includeData: z.boolean().optional().describe("Return image content for images (default true)."),
+      },
+    },
+    (async ({ workspaceId, key, includeData = true }: { workspaceId: string; key: string; includeData?: boolean }) => {
+      const { headers } = await gql.getConnectionAuth();
+      const url = `${gql.baseUrl}/api/workspaces/${encodeURIComponent(workspaceId)}/blobs/${encodeURIComponent(key)}`;
+      const response = await fetch(url, { headers });
+      if (!response.ok) throw new Error(`Blob fetch failed with HTTP ${response.status}.`);
+      const payload = Buffer.from(await response.arrayBuffer());
+      const contentType = response.headers.get("content-type")?.split(";")[0].trim() || "application/octet-stream";
+      const info = { workspaceId, key, url, contentType, size: payload.length, ...(readImageSize(payload) ?? {}) };
+      const result = text(info);
+      if (includeData && contentType.startsWith("image/") && contentType !== "image/svg+xml" && payload.length <= 5 * 1024 * 1024) {
+        result.content.unshift({ type: "image", data: payload.toString("base64"), mimeType: contentType } as any);
+      }
+      return result;
+    }) as any,
   );
 
   // DELETE BLOB

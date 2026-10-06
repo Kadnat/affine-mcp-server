@@ -258,9 +258,11 @@ AFFiNE's edgeless doc has two layers: top-level edgeless blocks (`note`, `frame`
 | Tool | Purpose | Notes |
 | --- | --- | --- |
 | `get_edgeless_canvas` | Read the full canvas: edgeless blocks + surface elements with parsed `{x,y,width,height}`, aggregate `bounds`, per-type `elementCounts` | Deterministic z-order (fractional-index sorted). Note entries carry a structured `children` array of their block descendants (`flavour`, `type`, `text`, `language`, `checked`) so markdown-seeded content round-trips faithfully. |
-| `compose_canvas` | Build a whole board in one call: shapes, texts, notes, images, connectors and frames | Nodes without `x`/`y` are auto-placed (`flow` by edge ranks, or `grid`/`row`/`column`) below existing content; shape sizes follow their labels; images accept `imageUrl`/`filePath`/`sourceId`. One document update |
+| `get_canvas_guide` | Board-authoring guidance: workflow, default style, layout rules, edit protocol, diagram conventions | Call without `step`, then with `design`, `edit` or `diagram` |
+| `compose_canvas` | Build or edit a whole board in one call: shapes, texts, notes, images, connectors and frames | Edit mode: items with `id` are patched (only sent fields change) or deleted with `deleted: true`. Nodes without `x`/`y` are auto-placed (`flow` by edge ranks, or `grid`/`row`/`column`) below existing content; shape sizes follow their labels; images accept `imageUrl`/`filePath`/`sourceId`. One document update |
 | `add_surface_element` | Add a `shape`, `connector`, `text`, or `group` to the surface | Shapes: rect/ellipse/diamond/triangle with fill, stroke, and text. Connectors accept `sourceId`/`targetId` and optional `sourcePosition`/`targetPosition` relative `[x,y]` in `[0,1]`. When both endpoints are bound by id and neither position is supplied, they auto-snap to BlockSuite's four tangent-carrying side-midpoints based on relative bounds. Creates the surface block if the doc doesn't have one. |
 | `render_canvas` | Screenshot the edgeless canvas (zoomed to fit) as a PNG image | Lets the agent check layout visually after edits. Needs a local Chrome and the `playwright` package; stdio transport |
+| `search_canvas` | Find things on a board: `overview` (frames, headings, counts) or `matches` by text, kind and/or scope rectangle | Returns ids usable with `compose_canvas` edit mode |
 | `list_surface_elements` | List all surface elements (optionally filter by `type` or `elementId`) | Returns raw `xywh` plus parsed `bounds` sorted by fractional `index` ascending; serializes `Y.Text` fields to plain strings. |
 | `update_surface_element` | Partially update an element by id | `x`/`y`/`width`/`height` merge with current `xywh` (move without resizing, or vice versa). `text`/`label`/`title` replace their `Y.Text` wholesale. Fields not applicable to the element's type come back in the response `ignored` list. |
 | `delete_surface_element` | Delete an element by id | `pruneConnectors: true` additionally removes any connectors referencing the deleted element. |
@@ -279,6 +281,17 @@ When the new block is a frame/note/edgeless_text on the canvas, `append_block` a
 | `stackAfter: { blockId, direction?, gap? }` | any canvas block | Position relative to one or more existing siblings. `blockId` may be an array — picks whichever ref is furthest in the stack direction (useful when stacking below a row of columns) and centers the new block on the union bounds' orthogonal axis (when widths match, same as inheriting the anchor's x). Caller-provided `x` / `y` on the orthogonal axis still wins. Default `gap` is direction-aware: **80px horizontal** (left/right), **40px vertical** (up/down) — mirrors native-flowchart spacing where the flow axis gets more breathing room. |
 | `padding` | used by `childElementIds` auto-sizing and as fallback `gap` for `stackAfter` | Default 40. Explicit `padding` on the block overrides the direction-aware default; explicit `stackAfter.gap` wins over both. |
 
+## Sharing
+
+| Tool | Purpose | Notes |
+| --- | --- | --- |
+| `list_workspace_members` | List members with id, name, email, role and status | Use to find user ids |
+| `get_doc_sharing` | Show a doc's public state, default role and per-user roles | |
+| `set_doc_user_role` | Grant, change or remove per-user access on a doc | Users by id or email; roles Reader, Commenter, Editor, Manager, or `remove` |
+| `set_doc_default_role` | Set the role every workspace member gets on a doc | `None` makes it private to explicitly shared people |
+| `invite_members` | Invite people to the workspace by email | Per-email errors are returned |
+| `create_invite_link` | Create or replace the workspace invite link | Expires after 1 day to 1 month |
+
 ## Comments
 
 | Tool | Purpose | Notes |
@@ -287,6 +300,7 @@ When the new block is a frame/note/edgeless_text on the canvas, `append_block` a
 | `create_comment` | Create a comment on a document | Plain text or a native AFFiNE `{ snapshot }` payload |
 | `update_comment` | Update comment content | Same content format as `create_comment` |
 | `delete_comment` | Delete a comment | Destructive |
+| `reply_comment` | Reply inside an existing comment thread | Use `list_comments` to find the thread id |
 | `resolve_comment` | Resolve or unresolve a comment | |
 
 Plain strings and legacy `{ text: "..." }` comment objects are converted to BlockSuite snapshots so AFFiNE can render them. Native `{ snapshot, attachments?, mode?, preview? }` payloads retain their rich content. Malformed snapshot payloads are rejected before mutation.
@@ -329,6 +343,7 @@ Plain strings and legacy `{ text: "..." }` comment objects are converted to Bloc
 | Tool | Purpose | Notes |
 | --- | --- | --- |
 | `upload_blob` | Upload a file or blob to workspace storage | Accepts exactly one of `content`, `filePath` or `url` (the last two on stdio transport only); images also return pixel `width`/`height`. Defaults to `encoding: "utf8"`; pass `encoding: "base64"` explicitly for binary content. The returned opaque key is accepted as image/attachment `sourceId`; it is not an external URL |
+| `get_blob` | Read a blob back by key | Returns URL, MIME type, size, image dimensions; images ≤ 5 MB are returned as image content |
 | `delete_blob` | Delete a blob from workspace storage | Permanent deletion requires `confirmKey` to exactly match `key`; false, exception, and unconfirmed outcomes return stable MCP errors |
 | `cleanup_blobs` | Permanently remove deleted blobs | `confirmWorkspaceId` must exactly match `workspaceId`; false, exception, and unconfirmed outcomes return stable MCP errors |
 
