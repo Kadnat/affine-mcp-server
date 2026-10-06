@@ -37,7 +37,7 @@ Flat colored paper on a white desk. No shadows, no gradients, no decoration.
 - Titles are big ink text on the paper (kind="text"), not text inside a dark filled box.
 - Siblings match: cards in a row, steps in a flow share size, fill and font. Encode a category with one small colored marker, not a different color per card.
 
-### Palette (AFFiNE tokens adapt to light and dark mode; prefer them to hex)
+### Palette (AFFiNE palette tokens; prefer them to hex. Note backgrounds adapt to dark mode, shape fills keep their color)
 - Shape fills (fillColor): --affine-palette-shape-{yellow, orange, tangerine, red, magenta, purple, navy, blue, teal, green, grey, white, black}
 - Lines and borders (strokeColor, edge stroke): --affine-palette-line-{same names}
 - Note backgrounds (background): --affine-note-background-{yellow, orange, red, magenta, purple, blue, teal, green, grey, white, black}
@@ -101,6 +101,7 @@ const DIAGRAM = `# Diagrams (flowcharts, processes, org charts, mind maps)
 - Color by group or branch: every node of one branch shares a family (fill + matching line token for the border). Edges of a branch can use that branch's line token.
 - Connectors: mode 1 (orthogonal) by default for trees and processes, mode 0 (straight) for short direct links, mode 2 (curved) only when the user wants an organic look. Be consistent within a diagram.
 - Label branches on the edge (label "Yes" / "No"), not with extra text boxes.
+- Pin sides when auto-routing would cross other links: fromSide/toSide on compose_canvas edges (e.g. a hub calling items below it: fromSide "bottom", toSide "top").
 - One flow direction per diagram. If the layout tangles, reorder nodes in the input (rank order follows input order) or split the diagram into frames.`;
 
 const STEPS: Record<string, string> = { design: DESIGN, edit: EDIT, diagram: DIAGRAM };

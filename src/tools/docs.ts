@@ -71,6 +71,7 @@ import {
   sortByFractionalIndex,
   stackRelativeTo,
   layoutNodes,
+  type EdgeSide,
   type LayoutMode,
 } from "../edgeless/layout.js";
 import { contentBlobKey, loadBlobSource, loadBlobUploadConfig, uploadBlobPayload } from "./blobStorage.js";
@@ -9350,6 +9351,7 @@ export function registerDocTools(
     color?: string;
     fontSize?: number;
     fontWeight?: string;
+    textAlign?: "left" | "center" | "right";
     sourceId?: string;
     targetId?: string;
     sourcePosition?: [number, number];
@@ -9477,8 +9479,8 @@ export function registerDocTools(
       fontSize: input.fontSize ?? 20,
       fontStyle: "normal",
       fontWeight: input.fontWeight ?? "600",
-      textAlign: "center",
-      textHorizontalAlign: "center",
+      textAlign: input.textAlign ?? "center",
+      textHorizontalAlign: input.textAlign ?? "center",
       textVerticalAlign: "center",
       textResizing: 1,
       maxWidth: false,
@@ -9639,7 +9641,7 @@ export function registerDocTools(
       fontSize: input.fontSize ?? 16,
       fontStyle: "normal",
       fontWeight: input.fontWeight ?? "400",
-      textAlign: "center",
+      textAlign: input.textAlign ?? "center",
       hasMaxWidth: false,
     };
   }
@@ -9714,10 +9716,10 @@ export function registerDocTools(
 
       // Auto-snap to the four tangent-carrying sides when the caller only
       // supplied ids — the renderer needs tangents to draw arrow heads.
-      if (srcBounds && tgtBounds && !params.sourcePosition && !params.targetPosition) {
+      if (srcBounds && tgtBounds && (!params.sourcePosition || !params.targetPosition)) {
         const natural = pickConnectorSides(srcBounds, tgtBounds);
-        data.source = { ...(data.source as any), position: SIDE_TO_NORMALIZED_POSITION[natural.from] };
-        data.target = { ...(data.target as any), position: SIDE_TO_NORMALIZED_POSITION[natural.to] };
+        if (!params.sourcePosition) data.source = { ...(data.source as any), position: SIDE_TO_NORMALIZED_POSITION[natural.from] };
+        if (!params.targetPosition) data.target = { ...(data.target as any), position: SIDE_TO_NORMALIZED_POSITION[natural.to] };
       }
 
       if (params.label) {
@@ -9853,6 +9855,7 @@ export function registerDocTools(
   // packages/affine/model/src/elements/{connector,shape}.ts).
   const FIELD_APPLICABILITY: Readonly<Record<string, ReadonlyArray<SurfaceElementType>>> = {
     shapeType:          ["shape"],
+    textAlign:          ["shape", "text"],
     radius:             ["shape"],
     filled:             ["shape"],
     fillColor:          ["shape"],
@@ -11138,6 +11141,7 @@ export function registerDocTools(
     color?: string;
     fontSize?: number;
     fontWeight?: string;
+    textAlign?: "left" | "center" | "right";
     background?: string;
     imageUrl?: string;
     filePath?: string;
@@ -11154,7 +11158,7 @@ export function registerDocTools(
     origin?: { x: number; y: number };
     defaults?: Omit<Partial<ComposeNode>, "key" | "x" | "y" | "text" | "markdown" | "imageUrl" | "filePath" | "sourceId">;
     nodes?: ComposeNode[];
-    edges?: Array<{ id?: string; deleted?: boolean; from?: string; to?: string; label?: string; stroke?: string; strokeStyle?: "solid" | "dash" | "none"; mode?: number; frontEndpointStyle?: string; rearEndpointStyle?: string }>;
+    edges?: Array<{ id?: string; deleted?: boolean; from?: string; to?: string; fromSide?: EdgeSide; toSide?: EdgeSide; label?: string; stroke?: string; strokeStyle?: "solid" | "dash" | "none"; mode?: number; frontEndpointStyle?: string; rearEndpointStyle?: string }>;
     frames?: Array<{ title: string; contains: string[]; background?: string }>;
   };
 
@@ -11218,7 +11222,7 @@ export function registerDocTools(
         updated.push({ id, ...patchSurfaceElement(el, {
           x: n.x, y: n.y, width: n.width, height: n.height, text: n.text,
           shapeType: n.shapeType, radius: n.radius, fillColor: n.fillColor, strokeColor: n.strokeColor,
-          strokeStyle: n.strokeStyle, color: n.color, fontSize: n.fontSize, fontWeight: n.fontWeight,
+          strokeStyle: n.strokeStyle, color: n.color, fontSize: n.fontSize, fontWeight: n.fontWeight, textAlign: n.textAlign,
         }) });
         continue;
       }
@@ -11383,6 +11387,8 @@ export function registerDocTools(
             shapeType: node.shapeType, radius: node.radius,
             fillColor: node.fillColor, strokeColor: node.strokeColor, strokeStyle: node.strokeStyle,
             color: node.color, fontSize: node.fontSize, fontWeight: node.fontWeight,
+            // Free-standing titles read best aligned to the content's left edge.
+            textAlign: node.textAlign ?? (kind === "text" ? "left" : undefined),
           });
           continue;
         }
@@ -11411,7 +11417,9 @@ export function registerDocTools(
       const edgeIds: string[] = [];
       newEdges.forEach((e, i) => {
         edgeIds.push(placeSurfaceElement(blocks, ctx.value, "connector", edgeIndices[i], {
-          sourceId: idOf(e.from!), targetId: idOf(e.to!), label: e.label, stroke: e.stroke,
+          sourceId: idOf(e.from!), targetId: idOf(e.to!),
+          ...(e.fromSide ? { sourcePosition: [...SIDE_TO_NORMALIZED_POSITION[e.fromSide]] as [number, number] } : {}),
+          ...(e.toSide ? { targetPosition: [...SIDE_TO_NORMALIZED_POSITION[e.toSide]] as [number, number] } : {}), label: e.label, stroke: e.stroke,
           // Orthogonal routing by default: curved connectors read as messy in processes and trees.
           strokeStyle: e.strokeStyle, mode: e.mode ?? 1, frontEndpointStyle: e.frontEndpointStyle, rearEndpointStyle: e.rearEndpointStyle,
         }));
@@ -11469,6 +11477,7 @@ export function registerDocTools(
     color: z.string().optional().describe("Text color (shape/text)."),
     fontSize: z.number().positive().optional(),
     fontWeight: z.string().optional().describe("e.g. 400, 600, 700."),
+    textAlign: z.enum(["left", "center", "right"]).optional().describe("Text alignment (shape/text). Default: left for kind=text, center for shapes."),
     background: z.string().optional().describe("Note background token."),
     imageUrl: z.string().url().optional().describe("Image only: http(s) URL to download and upload (stdio only)."),
     filePath: z.string().optional().describe("Image only: absolute local file path (stdio only)."),
@@ -11497,6 +11506,8 @@ export function registerDocTools(
           deleted: z.boolean().optional(),
           from: z.string().optional().describe("Node key (or an existing element/block id). Required for new edges."),
           to: z.string().optional(),
+          fromSide: z.enum(["top", "bottom", "left", "right"]).optional().describe("Pin where the connector leaves its source (e.g. 'bottom' for a branch going down). Default: auto."),
+          toSide: z.enum(["top", "bottom", "left", "right"]).optional().describe("Pin where the connector enters its target. Default: auto."),
           label: z.string().optional(),
           stroke: z.string().optional().describe("Line color token, e.g. --affine-palette-line-grey."),
           strokeStyle: z.enum(["solid", "dash", "none"]).optional(),
