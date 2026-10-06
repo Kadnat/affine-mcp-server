@@ -11085,6 +11085,7 @@ export function registerDocTools(
       .string()
       .optional()
       .describe("Font weight (shape default 600, text default 400). Shape/text."),
+    textAlign: z.enum(["left", "center", "right"]).optional().describe("Text alignment (default center). Shape/text."),
     sourceId: z.string().optional().describe("Connector source element id. Connector only."),
     targetId: z.string().optional().describe("Connector target element id. Connector only."),
     sourcePosition: z
