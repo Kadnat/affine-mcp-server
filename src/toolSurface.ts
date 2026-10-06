@@ -75,6 +75,7 @@ export const ALL_TOOLS = [
   "remove_doc_from_collection",
   "remove_tag_from_doc",
   "rename_folder",
+  "render_canvas",
   "reparent_mindmap_node",
   "replace_doc_with_markdown",
   "resolve_comment",
@@ -198,6 +199,7 @@ const TOOL_GROUPS: Record<ToolName, readonly string[]> = {
   read_doc: ["docs", "docs.read", "read"],
   remove_doc_from_collection: ["organize", "organize.collections", "organize.write", "write"],
   remove_tag_from_doc: ["docs", "docs.tags", "docs.write", "write"],
+  render_canvas: ["docs", "docs.read", "read"],
   rename_folder: ["organize", "organize.folders", "organize.write", "experimental", "write"],
   replace_doc_with_markdown: ["docs", "docs.markdown", "docs.write", "destructive", "write"],
   resolve_comment: ["comments", "comments.write", "write"],
@@ -259,6 +261,7 @@ const READ_ONLY_TOOLS = new Set<ToolName>([
   "read_database_cells",
   "read_database_columns",
   "read_doc",
+  "render_canvas",
   "search_docs",
   "sign_in",
 ]);

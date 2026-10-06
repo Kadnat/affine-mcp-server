@@ -1904,6 +1904,40 @@ export function registerDocTools(
     return map;
   }
 
+  function nextSurfaceElementIndex(valueMap: Y.Map<any>): string {
+    let maxIndex: string | null = null;
+    for (const [, el] of valueMap.entries()) {
+      if (!(el instanceof Y.Map)) continue;
+      const idx = el.get("index");
+      if (typeof idx !== "string") continue;
+      if (maxIndex === null || idx > maxIndex) maxIndex = idx;
+    }
+    return generateKeyBetween(maxIndex, null);
+  }
+
+  // Surface elements and canvas blocks (notes, and blocks under affine:surface)
+  // share one z-order, so the next index must be above both.
+  function nextCanvasIndex(blocks: Y.Map<any>): string {
+    let maxIndex: string | null = null;
+    const consider = (idx: unknown) => {
+      if (typeof idx === "string" && (maxIndex === null || idx > maxIndex)) maxIndex = idx;
+    };
+    const surfaceId = findBlockIdByFlavour(blocks, "affine:surface");
+    const surface = surfaceId ? blocks.get(surfaceId) : null;
+    const value = surface instanceof Y.Map ? surface.get("prop:elements")?.get?.("value") : null;
+    if (value instanceof Y.Map) {
+      for (const [, el] of value.entries()) if (el instanceof Y.Map) consider(el.get("index"));
+    }
+    const surfaceChildren = new Set<string>(
+      surface instanceof Y.Map && surface.get("sys:children") instanceof Y.Array ? surface.get("sys:children").toArray() : [],
+    );
+    for (const [id, b] of blocks.entries()) {
+      if (!(b instanceof Y.Map)) continue;
+      if (b.get("sys:flavour") === "affine:note" || surfaceChildren.has(id)) consider(b.get("prop:index"));
+    }
+    return generateKeyBetween(maxIndex, null);
+  }
+
   function ensureSurfaceBlock(blocks: Y.Map<any>): string {
     const existingSurfaceId = findBlockIdByFlavour(blocks, "affine:surface");
     if (existingSurfaceId) {
@@ -2138,7 +2172,7 @@ export function registerDocTools(
       throw new Error("The 'reference'/'refFlavour' fields can only be used with type='surface_ref'.");
     }
 
-    if (normalized.type === "frame" || normalized.type === "edgeless_text" || normalized.type === "note") {
+    if (normalized.type === "frame" || normalized.type === "edgeless_text" || normalized.type === "note" || normalized.type === "image") {
       if (!Number.isInteger(normalized.width) || normalized.width < 1 || normalized.width > 10000) {
         throw new Error(`${normalized.type} width must be an integer between 1 and 10000.`);
       }
@@ -2146,7 +2180,7 @@ export function registerDocTools(
         throw new Error(`${normalized.type} height must be an integer between 1 and 10000.`);
       }
     } else if ((raw.width !== undefined || raw.height !== undefined) && normalized.strict) {
-      throw new Error("The 'width'/'height' fields are only valid for frame/edgeless_text/note.");
+      throw new Error("The 'width'/'height' fields are only valid for frame/edgeless_text/note/image.");
     }
 
     if (normalized.type !== "frame" && normalized.type !== "note" && raw.background !== undefined && normalized.strict) {
@@ -2357,7 +2391,7 @@ export function registerDocTools(
 
   function resolveInsertContext(
     blocks: Y.Map<any>,
-    normalized: Pick<NormalizedAppendBlockInput, "placement" | "strict" | "type">,
+    normalized: Pick<NormalizedAppendBlockInput, "placement" | "strict" | "type" | "xProvided" | "yProvided">,
   ): {
     parentId: string;
     parentBlock: Y.Map<any>;
@@ -2395,7 +2429,11 @@ export function registerDocTools(
     }
 
     if (!parentId) {
-      if (normalized.type === "frame" || normalized.type === "edgeless_text") {
+      if (
+        normalized.type === "frame" ||
+        normalized.type === "edgeless_text" ||
+        (normalized.type === "image" && (normalized.xProvided || normalized.yProvided))
+      ) {
         parentId = ensureSurfaceBlock(blocks);
       } else if (normalized.type === "note") {
         parentId = findBlockIdByFlavour(blocks, "affine:page") || undefined;
@@ -2418,7 +2456,8 @@ export function registerDocTools(
       if (
         parentFlavour === "affine:surface" &&
         normalized.type !== "frame" &&
-        normalized.type !== "edgeless_text"
+        normalized.type !== "edgeless_text" &&
+        normalized.type !== "image"
       ) {
         throw new Error(`Cannot append '${normalized.type}' directly under 'affine:surface'.`);
       }
@@ -3324,6 +3363,13 @@ export function registerDocTools(
       resolveEdgelessLayoutHints(blocks, normalized);
       const context = resolveInsertContext(blocks, normalized);
       const { blockId, block, flavour, blockType, extraBlocks } = createBlock(normalized);
+      const parentFlavour = context.parentBlock.get("sys:flavour");
+      if (parentFlavour === "affine:surface" || flavour === "affine:note") {
+        block.set("prop:index", nextCanvasIndex(blocks));
+        if (flavour === "affine:image") {
+          block.set("prop:xywh", `[${normalized.x},${normalized.y},${normalized.width},${normalized.height}]`);
+        }
+      }
 
       blocks.set(blockId, block);
       if (Array.isArray(extraBlocks)) {
@@ -6825,9 +6871,9 @@ export function registerDocTools(
         design: z.string().optional().describe("Design payload for embed_html"),
         reference: z.string().optional().describe("Target id for surface_ref"),
         refFlavour: z.string().optional().describe("Target flavour for surface_ref (e.g. affine:frame)"),
-        x: z.number().int().optional().describe("X position on the edgeless canvas for frame/edgeless_text/note (default 0). Prefer ≥40px between sibling bounds; BlockSuite does not auto-arrange."),
-        y: z.number().int().optional().describe("Y position on the edgeless canvas for frame/edgeless_text/note (default 0)."),
-        width: z.number().int().min(1).max(10000).optional().describe("Width for frame/edgeless_text/note."),
+        x: z.number().int().optional().describe("X position on the edgeless canvas for frame/edgeless_text/note/image (default 0). For type=image, passing x or y places the image directly on the canvas (under affine:surface) instead of inside a note. Prefer ≥40px between sibling bounds; BlockSuite does not auto-arrange."),
+        y: z.number().int().optional().describe("Y position on the edgeless canvas for frame/edgeless_text/note/image (default 0)."),
+        width: z.number().int().min(1).max(10000).optional().describe("Width for frame/edgeless_text/note/image. For canvas images, keep the aspect ratio of the width/height returned by upload_blob."),
         height: z.number().int().min(1).max(10000).optional().describe("Height for frame/edgeless_text/note. When `markdown` is set and height is omitted, an over-estimate is computed from the content — AFFiNE's render-time ResizeObserver corrects `prop:xywh` to the true DOM-measured height on first browser open."),
         background: z.any().optional().describe("Background for frame/note. Frame default 'transparent'. For notes, prefer AFFiNE's adaptive `--affine-note-background-<color>` family — `blue` / `purple` / `yellow` / `green` / `teal` / `red` / `orange` / `magenta` / `grey` / `white` / `black`. For specific per-theme colors, pass a `{light, dark}` hex object like `{light:'#fff', dark:'#252525'}`."),
         markdown: z.string().optional().describe("When type='note', parse this markdown into heading/paragraph/list/code child blocks inside the note (BlockSuite-native: mirrors what happens when you paste markdown into an edgeless note). Takes precedence over 'text' for note children. Ignored for other block types."),
@@ -9570,16 +9616,6 @@ export function registerDocTools(
     };
   }
 
-  function nextSurfaceElementIndex(valueMap: Y.Map<any>): string {
-    let maxIndex: string | null = null;
-    for (const [, el] of valueMap.entries()) {
-      if (!(el instanceof Y.Map)) continue;
-      const idx = el.get("index");
-      if (typeof idx !== "string") continue;
-      if (maxIndex === null || idx > maxIndex) maxIndex = idx;
-    }
-    return generateKeyBetween(maxIndex, null);
-  }
 
   function buildSurfaceElementData(
     type: SurfaceElementType,
@@ -9633,7 +9669,7 @@ export function registerDocTools(
       const prevSV = Y.encodeStateVector(doc);
       const blocks = doc.getMap("blocks") as Y.Map<any>;
       const ctx = getSurfaceElementsValueMap(blocks, { create: true })!;
-      const index = params.index ?? nextSurfaceElementIndex(ctx.value);
+      const index = params.index ?? nextCanvasIndex(blocks);
 
       // Mirror updateSurfaceElementHandler: report inapplicable gated fields
       // in `ignored` instead of silently dropping them at the per-type builder.
@@ -10131,9 +10167,9 @@ export function registerDocTools(
         throw new Error(`Block '${params.blockId}' not found.`);
       }
       const flavour = block.get("sys:flavour");
-      if (flavour !== "affine:note" && flavour !== "affine:frame" && flavour !== "affine:edgeless-text") {
+      if (flavour !== "affine:note" && flavour !== "affine:frame" && flavour !== "affine:edgeless-text" && flavour !== "affine:image") {
         throw new Error(
-          `Block '${params.blockId}' has flavour '${String(flavour)}' — update_edgeless_block only mutates note/frame/edgeless-text blocks.`
+          `Block '${params.blockId}' has flavour '${String(flavour)}' — update_edgeless_block only mutates note/frame/edgeless-text/image blocks.`
         );
       }
 
@@ -10844,11 +10880,17 @@ export function registerDocTools(
         return result;
       };
 
+      const surfaceBlockForChildren = blocks.get(findBlockIdByFlavour(blocks, "affine:surface") ?? "");
+      const surfaceChildIds = new Set<string>(
+        surfaceBlockForChildren instanceof Y.Map ? childIdsFrom(surfaceBlockForChildren.get("sys:children")) : [],
+      );
       const edgelessBlocks: Record<string, any>[] = [];
       for (const [id, raw] of blocks.entries()) {
         if (!(raw instanceof Y.Map)) continue;
         const flavour = raw.get("sys:flavour");
-        if (typeof flavour !== "string" || !edgelessFlavours.has(flavour)) continue;
+        // Blocks dropped straight on the canvas (e.g. images) are children of affine:surface.
+        const onSurface = surfaceChildIds.has(String(id));
+        if (typeof flavour !== "string" || (!edgelessFlavours.has(flavour) && !onSurface)) continue;
         const xywhRaw = raw.get("prop:xywh");
         const bounds = parseXywhString(xywhRaw);
         const propIndex = raw.get("prop:index");
@@ -10869,6 +10911,9 @@ export function registerDocTools(
           const lines = collectNoteText(String(id));
           entry.text = lines.length ? lines.join("\n") : null;
           entry.color = raw.get("prop:color") ?? null;
+        } else if (flavour === "affine:image") {
+          entry.sourceId = raw.get("prop:sourceId") ?? null;
+          entry.caption = raw.get("prop:caption") ?? null;
         } else if (flavour === "affine:note") {
           const lines = collectNoteText(String(id));
           entry.text = lines.length ? lines.join("\n") : null;
@@ -11105,7 +11150,7 @@ export function registerDocTools(
     {
       title: "Update Edgeless Block",
       description:
-        "Partially update a note/frame/edgeless-text block by id. x/y/width/height merge with current prop:xywh (move without resizing, or vice versa). background replaces prop:background (AFFiNE token or `{light, dark}` hex object). Fields that don't apply to the block's flavour come back under `ignored`.",
+        "Partially update a note/frame/edgeless-text/image block by id. x/y/width/height merge with current prop:xywh (move without resizing, or vice versa). background replaces prop:background (AFFiNE token or `{light, dark}` hex object). Fields that don't apply to the block's flavour come back under `ignored`.",
       inputSchema: {
         workspaceId: z.string().optional().describe("Workspace ID (optional if default set)"),
         docId: DocId.describe("Document ID"),

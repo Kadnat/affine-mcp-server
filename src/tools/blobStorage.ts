@@ -6,6 +6,7 @@ import FormData from "form-data";
 import fetch from "node-fetch";
 import { requireMatchingConfirmation } from "../util/inputSchemas.js";
 import { readLimitedResponseBody } from "../util/httpResponse.js";
+import { readImageSize } from "../util/imageSize.js";
 
 export type BlobContentEncoding = "utf8" | "base64";
 
@@ -119,6 +120,46 @@ export function decodeBlobContent(
   return decoded;
 }
 
+const MIME_BY_EXT: Record<string, string> = {
+  png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif",
+  webp: "image/webp", svg: "image/svg+xml", pdf: "application/pdf",
+};
+
+function guessMime(name: string): string | undefined {
+  return MIME_BY_EXT[name.split(".").pop()?.toLowerCase() ?? ""];
+}
+
+// filePath/url read from the machine running the server, so they are only
+// allowed for a local stdio server (in HTTP mode they would be file read / SSRF).
+async function loadBlobSource(
+  src: { content?: string; encoding: BlobContentEncoding; filePath?: string; url?: string },
+  maxDecodedBytes: number,
+): Promise<{ payload: Buffer; filename?: string; contentType?: string }> {
+  const given = [src.content !== undefined, !!src.filePath, !!src.url].filter(Boolean).length;
+  if (given !== 1) throw new Error("Provide exactly one of content, filePath, or url.");
+  if (src.content !== undefined) {
+    return { payload: decodeBlobContent(src.content, src.encoding, maxDecodedBytes) };
+  }
+  const transport = (process.env.MCP_TRANSPORT || "stdio").toLowerCase();
+  if (transport !== "stdio") throw new Error("filePath and url are only available with MCP_TRANSPORT=stdio.");
+  if (src.filePath) {
+    const { readFile, stat } = await import("node:fs/promises");
+    const { basename } = await import("node:path");
+    assertWithinDecodedLimit((await stat(src.filePath)).size, maxDecodedBytes);
+    const name = basename(src.filePath);
+    return { payload: await readFile(src.filePath), filename: name, contentType: guessMime(name) };
+  }
+  const url = new URL(src.url as string);
+  if (url.protocol !== "https:" && url.protocol !== "http:") throw new Error("url must be http(s).");
+  const response = await fetch(url.href, { redirect: "follow" });
+  if (!response.ok) throw new Error(`Fetching url failed with HTTP ${response.status}.`);
+  const payload = Buffer.from(await response.arrayBuffer());
+  assertWithinDecodedLimit(payload.length, maxDecodedBytes);
+  const name = decodeURIComponent(url.pathname.split("/").pop() || "") || undefined;
+  const headerType = response.headers.get("content-type")?.split(";")[0].trim();
+  return { payload, filename: name, contentType: headerType || (name ? guessMime(name) : undefined) };
+}
+
 function parseUploadResponse(body: string): BlobUploadGraphQLResponse {
   if (!body) {
     throw new Error("Blob upload returned an empty response.");
@@ -175,20 +216,25 @@ export function registerBlobTools(
     workspaceId,
     content,
     encoding = "utf8",
+    filePath,
+    url,
     filename,
     contentType,
   }: {
     workspaceId: string;
-    content: string;
+    content?: string;
+    filePath?: string;
+    url?: string;
     encoding?: BlobContentEncoding;
     filename?: string;
     contentType?: string;
   }) => {
     try {
       const { endpoint, headers } = await gql.getConnectionAuth();
-      const payload = decodeBlobContent(content, encoding, uploadConfig.maxDecodedBytes);
-      const safeFilename = validateMultipartMetadata(filename ?? `blob-${Date.now()}.bin`, "filename");
-      const mime = validateMultipartMetadata(contentType ?? "application/octet-stream", "contentType");
+      const source = await loadBlobSource({ content, encoding, filePath, url }, uploadConfig.maxDecodedBytes);
+      const payload = source.payload;
+      const safeFilename = validateMultipartMetadata(filename ?? source.filename ?? `blob-${Date.now()}.bin`, "filename");
+      const mime = validateMultipartMetadata(contentType ?? source.contentType ?? "application/octet-stream", "contentType");
 
       const form = new FormData();
       form.append("operations", JSON.stringify({
@@ -250,6 +296,7 @@ export function registerBlobTools(
           contentType: mime,
           encoding,
           size: payload.length,
+          ...(readImageSize(payload) ?? {}),
           uploadedAt: new Date().toISOString()
         });
       } catch (error: any) {
@@ -279,10 +326,12 @@ export function registerBlobTools(
     "upload_blob",
     {
       title: "Upload Blob",
-      description: "Upload a file or blob into AFFiNE workspace storage and return its blob key. This creates stored content but does not attach it to a document by itself.",
+      description: "Upload a file or blob into AFFiNE workspace storage and return its blob key. For images the result also includes pixel width/height; pass the key as sourceId to append_block type=image (with x/y on the edgeless canvas). This creates stored content but does not attach it to a document by itself.",
       inputSchema: {
         workspaceId: z.string().describe("AFFiNE workspace id that owns the blob."),
-        content: z.string().describe("Blob content encoded according to the encoding field."),
+        content: z.string().optional().describe("Blob content encoded according to the encoding field. Provide exactly one of content, filePath, or url."),
+        filePath: z.string().min(1).optional().describe("Absolute path of a local file to upload (stdio transport only). Filename and MIME type are inferred."),
+        url: z.string().url().optional().describe("http(s) URL to download and upload (stdio transport only). Filename and MIME type are inferred."),
         encoding: z.enum(["utf8", "base64"]).default("utf8").describe("Content encoding. Defaults to utf8; use base64 explicitly for binary data."),
         filename: z.string().min(1).max(255).optional().describe("Optional filename stored with the upload. Defaults to a generated .bin name."),
         contentType: z.string().min(1).max(255).optional().describe("Optional MIME type. Defaults to application/octet-stream.")
